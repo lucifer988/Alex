@@ -40,7 +40,7 @@ Alex 不修改 OpenPPP2 密钥、服务器地址、代理、路由、DNS、SNAT 
 
 Alex 使用补偿事务而不是分布式共识：普通命令失败和 SSH 中断由双端备份/watchdog 回退；如果协调客户端恰好在两端最终撤销 watchdog 的极短窗口内被 `SIGKILL` 或断电，仍可能需要人工核对两端配置。生产运行时应保持管理机供电和 SSH 管理链路稳定。
 
-本机安装脚本会安装 `jq`、`iperf3`、OpenSSH client、`util-linux` 和 `iproute2` 等缺失依赖。连接成功后，Alex 会通过远端的 `apt`、`dnf`、`yum` 或 `apk` 自动补齐 `jq`、`iperf3`、`iproute2`、systemd 和 coreutils；SSH 用户必须具备相应 sudo 权限。
+本机安装脚本会安装 `jq`、`iperf3`、OpenSSH client、`util-linux` 和 `iproute2` 等缺失依赖。连接成功后，Alex 会通过远端的 `apt`、`dnf` 或 `yum` 自动补齐 `jq`、`iperf3`、`iproute2`、systemd 和 coreutils；SSH 用户必须具备相应 sudo 权限。OpenRC-only 系统不受支持。
 
 ## 安装
 

@@ -25,11 +25,13 @@ install_deps() {
         dnf install -y jq iperf3 openssh-clients util-linux iproute coreutils systemd
     elif command -v yum >/dev/null; then
         yum install -y jq iperf3 openssh-clients util-linux iproute coreutils systemd
-    elif command -v apk >/dev/null; then
-        apk add --no-cache bash jq iperf3 openssh-client util-linux iproute2 coreutils openrc
     else
-        die '无法识别包管理器，请手工安装 jq、iperf3、openssh-client、util-linux、iproute2、systemd'
+        die '无法识别受支持的 systemd 发行版包管理器，请手工安装 jq、iperf3、openssh-client、util-linux、iproute2、systemd'
     fi
+
+    for tool in bash jq iperf3 ssh sha256sum flock ip systemctl systemd-run; do
+        command -v "$tool" >/dev/null 2>&1 || die "依赖安装后仍缺少: $tool"
+    done
 }
 
 install_deps
