@@ -28,6 +28,6 @@ jobs:
           sudo env PREFIX="$root/usr/local" ALEX_ETC_DIR="$root/etc/alex" bash install.sh
           test -L "$root/usr/local/sbin/alex"
           "$root/usr/local/sbin/alex" --help | grep -q 'OpenPPP2 双端自动调优'
-          rm -rf "$root"
+          sudo rm -rf "$root"
       - name: Diff hygiene
         run: git diff --check
