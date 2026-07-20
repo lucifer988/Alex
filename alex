@@ -152,21 +152,24 @@ ensure_remote_dependencies() {
     ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo -- sh -s <<'SH'
 set -eu
 missing=0
-for tool in bash jq iperf3 flock ip systemctl systemd-run sha256sum install stat ss; do
+for tool in awk base64 bash cat flock grep ip iperf3 install jq ps seq sha256sum sleep ss stat sync systemctl systemd-run tr; do
     command -v "$tool" >/dev/null 2>&1 || missing=1
 done
 [ "$missing" -eq 0 ] && exit 0
 if command -v apt-get >/dev/null 2>&1; then
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y bash jq iperf3 util-linux iproute2 coreutils systemd
+    DEBIAN_FRONTEND=noninteractive apt-get install -y bash jq iperf3 util-linux iproute2 coreutils procps grep mawk systemd
 elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y bash jq iperf3 util-linux iproute coreutils systemd
+    dnf install -y bash jq iperf3 util-linux iproute coreutils procps-ng grep gawk systemd
 elif command -v yum >/dev/null 2>&1; then
-    yum install -y bash jq iperf3 util-linux iproute coreutils systemd
+    yum install -y bash jq iperf3 util-linux iproute coreutils procps-ng grep gawk systemd
 else
     echo 'Alex: 远端缺少依赖，且不是受支持的 systemd 发行版' >&2
     exit 1
 fi
+for tool in awk base64 bash cat flock grep ip iperf3 install jq ps seq sha256sum sleep ss stat sync systemctl systemd-run tr; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "Alex: 远端安装后仍缺少 $tool" >&2; exit 1; }
+done
 SH
 }
 
