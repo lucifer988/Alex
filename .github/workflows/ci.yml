@@ -25,7 +25,7 @@ jobs:
       - name: Isolated install smoke test
         run: |
           root=$(mktemp -d)
-          PREFIX="$root/usr/local" ALEX_ETC_DIR="$root/etc/alex" sudo -E bash install.sh
+          sudo env PREFIX="$root/usr/local" ALEX_ETC_DIR="$root/etc/alex" bash install.sh
           test -L "$root/usr/local/sbin/alex"
           "$root/usr/local/sbin/alex" --help | grep -q 'OpenPPP2 双端自动调优'
           rm -rf "$root"
