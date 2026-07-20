@@ -227,7 +227,9 @@ test_counter_reset_is_reported_as_instability() {
 }
 
 test_benchmark_rejects_pid_change_during_sampling() (
+    # shellcheck disable=SC2030,SC2031
     export ALEX_LIB="$ROOT/lib/alex-core.sh"
+    # shellcheck disable=SC2030,SC2031
     export ALEX_NODE_HELPER=/bin/true
     # shellcheck source=../alex
     source "$ROOT/alex"
@@ -266,6 +268,55 @@ test_missing_option_value_has_clear_failure() {
     [[ "$output" == *'参数 --ssh-host 缺少值'* && "$next_option" == *'参数 --ssh-host 缺少值'* ]]
 }
 
+test_remote_mode_validation_accepts_only_client_or_server() {
+    alex_validate_remote_mode client &&
+        alex_validate_remote_mode server &&
+        ! alex_validate_remote_mode bogus
+}
+
+test_bench_mode_validation_accepts_only_managed_or_existing() {
+    alex_validate_bench_mode managed &&
+        alex_validate_bench_mode existing &&
+        ! alex_validate_bench_mode random
+}
+
+test_option_parse_accepts_server_mode_and_existing_bench() (
+    # shellcheck disable=SC2030,SC2031
+    export ALEX_LIB="$ROOT/lib/alex-core.sh"
+    # shellcheck disable=SC2030,SC2031
+    export ALEX_NODE_HELPER=/bin/true
+    # shellcheck source=../alex
+    source "$ROOT/alex"
+    parse_args optimize --ssh-host 1.2.3.4 --ssh-key /tmp/key --remote-mode server --bench-mode existing --bench-target 8.8.8.8 --bench-port 5201 --yes
+    [[ "$REMOTE_MODE" == server && "$BENCH_MODE" == existing && "$BENCH_TARGET" == 8.8.8.8 ]]
+)
+
+test_existing_bench_mode_uses_bench_target() (
+    # shellcheck disable=SC2030,SC2031
+    export ALEX_LIB="$ROOT/lib/alex-core.sh"
+    # shellcheck disable=SC2030,SC2031
+    export ALEX_NODE_HELPER=/bin/true
+    # shellcheck source=../alex
+    source "$ROOT/alex"
+    WORKDIR=$(mktemp -d)
+    trap 'rm -rf "$WORKDIR"' EXIT
+    BENCH_MODE=existing
+    BENCH_TARGET=8.8.8.8
+    TUN_SERVER=10.0.0.1
+    BENCH_PORT=5201
+    TIME=1
+    captures="$WORKDIR/captures"
+    mkdir -p "$captures"
+    # shellcheck disable=SC2317,SC2329
+    remote_exec() { return 99; }
+    # shellcheck disable=SC2317,SC2329
+    iperf3() { printf '{"end":{"sum_received":{"bits_per_second":1000000},"sum_sent":{"retransmits":0}}}\n' > "$captures/out.json"; }
+    # shellcheck disable=SC2317,SC2329
+    mktemp() { printf '%s\n' "$captures/out.json"; }
+    result=$(iperf_sample 0)
+    [[ "$result" == $'1\t0' ]]
+)
+
 test_case 'score caps fixed 1000/60 access limits' test_score_caps_download_and_upload
 test_case 'score rejects unstable candidates' test_score_rejects_unstable_candidate
 test_case 'score penalizes retransmits and CPU saturation' test_score_penalizes_retransmits_and_cpu
@@ -290,6 +341,10 @@ test_case 'counter reset does not mask other endpoint drops' test_counter_delta_
 test_case 'counter reset is marked unstable' test_counter_reset_is_reported_as_instability
 test_case 'benchmark rejects service PID changes' test_benchmark_rejects_pid_change_during_sampling
 test_case 'missing option values fail clearly' test_missing_option_value_has_clear_failure
+test_case 'remote mode validation only allows client/server' test_remote_mode_validation_accepts_only_client_or_server
+test_case 'bench mode validation only allows managed/existing' test_bench_mode_validation_accepts_only_managed_or_existing
+test_case 'parse_args accepts server mode and existing bench' test_option_parse_accepts_server_mode_and_existing_bench
+test_case 'existing bench mode uses explicit bench target' test_existing_bench_mode_uses_bench_target
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

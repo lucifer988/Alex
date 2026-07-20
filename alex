@@ -23,7 +23,10 @@ LOCAL_SERVICE=openppp2-client.service
 REMOTE_SERVICE=openppp2-server.service
 LOCAL_TUN=ppp0
 REMOTE_TUN=ppp0
+REMOTE_MODE=client
+BENCH_MODE=managed
 TUN_SERVER=10.0.0.1
+BENCH_TARGET=
 BENCH_PORT=5201
 TIME=15
 REPEATS=3
@@ -62,7 +65,10 @@ Alex - OpenPPP2 双端自动调优
   --remote-service UNIT           服务端 systemd 服务
   --local-tun IFACE               客户端 TUN 接口，默认 ppp0
   --remote-tun IFACE              服务端 TUN 接口，默认 ppp0
+  --remote-mode MODE              远端模式：client 或 server，默认 client
+  --bench-mode MODE               测速模式：managed 或 existing，默认 managed
   --tun-server IP                 隧道内服务端地址，默认 10.0.0.1
+  --bench-target IP               复用已有测速服务时的目标地址
   --bench-port PORT               iperf3 测速端口，默认 5201
   --download-cap MBPS             默认且最大评分目标 1000
   --upload-cap MBPS               默认且最大评分目标 60
@@ -98,7 +104,10 @@ parse_args() {
             --remote-service) need_value "$@"; REMOTE_SERVICE=$2; shift 2 ;;
             --local-tun) need_value "$@"; LOCAL_TUN=$2; shift 2 ;;
             --remote-tun) need_value "$@"; REMOTE_TUN=$2; shift 2 ;;
+            --remote-mode) need_value "$@"; REMOTE_MODE=$2; shift 2 ;;
+            --bench-mode) need_value "$@"; BENCH_MODE=$2; shift 2 ;;
             --tun-server) need_value "$@"; TUN_SERVER=$2; shift 2 ;;
+            --bench-target) need_value "$@"; BENCH_TARGET=$2; shift 2 ;;
             --bench-port) need_value "$@"; BENCH_PORT=$2; shift 2 ;;
             --download-cap) need_value "$@"; DOWNLOAD_CAP=$2; shift 2 ;;
             --upload-cap) need_value "$@"; UPLOAD_CAP=$2; shift 2 ;;
@@ -123,8 +132,15 @@ validate() {
     alex_validate_service "$LOCAL_SERVICE" || die '本地服务名非法'
     alex_validate_service "$REMOTE_SERVICE" || die '远端服务名非法'
     alex_validate_interface "$LOCAL_TUN" || die '本地 TUN 接口名非法'
-    alex_validate_interface "$REMOTE_TUN" || die '远端 TUN 接口名非法'
+    alex_validate_remote_mode "$REMOTE_MODE" || die '远端模式非法'
+    alex_validate_bench_mode "$BENCH_MODE" || die '测速模式非法'
+    if [[ "$REMOTE_MODE" == client ]]; then
+        alex_validate_interface "$REMOTE_TUN" || die '远端 TUN 接口名非法'
+    fi
     alex_validate_tunnel_address "$TUN_SERVER" || die '隧道服务端地址非法'
+    if [[ "$BENCH_MODE" == existing ]]; then
+        alex_validate_tunnel_address "$BENCH_TARGET" || die '已有测速服务目标地址非法'
+    fi
     if ! [[ "$DOWNLOAD_CAP" =~ ^[0-9]+$ ]] || (( DOWNLOAD_CAP < 1 || DOWNLOAD_CAP > 1000 )); then die '下载上限必须为 1-1000 Mbps'; fi
     if ! [[ "$UPLOAD_CAP" =~ ^[0-9]+$ ]] || (( UPLOAD_CAP < 1 || UPLOAD_CAP > 60 )); then die '上传上限必须为 1-60 Mbps'; fi
     if ! [[ "$TIME" =~ ^[0-9]+$ ]] || (( TIME < 5 || TIME > 120 )); then die '测速时间必须为 5-120 秒'; fi
@@ -257,7 +273,7 @@ prepare_transaction() {
     LOCAL_PREPARED=1
     "$NODE_HELPER" prepare "$TXID" "$LOCAL_CONFIG" "$LOCAL_SERVICE" "$LOCAL_TUN" >/dev/null
     REMOTE_PREPARED=1
-    remote_exec prepare "$TXID" "$REMOTE_CONFIG" "$REMOTE_SERVICE" "$REMOTE_TUN" >/dev/null
+    remote_exec prepare "$TXID" "$REMOTE_CONFIG" "$REMOTE_SERVICE" "$REMOTE_TUN" "$REMOTE_MODE" >/dev/null
     install -m 0600 "$LOCAL_CONFIG" "$WORKDIR/base-local.json"
     ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo -n -- cat -- "$REMOTE_CONFIG" >"$WORKDIR/base-remote.json"
     jq -e 'type == "object"' "$WORKDIR/base-remote.json" >/dev/null
@@ -285,8 +301,13 @@ health_pair() {
     remote_health=$(remote_exec health "$TXID")
     jq -e '.ok and ([.pid,.restarts,.cpu_percent,.tun_drops] | all(.[]; type == "number" and . >= 0)) and .pid > 0' \
         <<<"$local_health" >/dev/null
-    jq -e '.ok and ([.pid,.restarts,.cpu_percent,.tun_drops] | all(.[]; type == "number" and . >= 0)) and .pid > 0' \
-        <<<"$remote_health" >/dev/null
+    if [[ "$REMOTE_MODE" == server ]]; then
+        jq -e '.ok and ([.pid,.restarts,.cpu_percent,.tun_drops] | all(.[]; type == "number" and . >= 0)) and .pid > 0' \
+            <<<"$remote_health" >/dev/null
+    else
+        jq -e '.ok and ([.pid,.restarts,.cpu_percent,.tun_drops] | all(.[]; type == "number" and . >= 0)) and .pid > 0' \
+            <<<"$remote_health" >/dev/null
+    fi
     jq -n --argjson l "$local_health" --argjson r "$remote_health" \
         '{cpu_percent:([$l.cpu_percent,$r.cpu_percent]|max),
           local_drops:$l.tun_drops,remote_drops:$r.tun_drops,
@@ -296,8 +317,14 @@ health_pair() {
 
 iperf_sample() {
     local reverse=$1 json_file
-    remote_exec bench-server "$TXID" "$BENCH_PORT" "$TUN_SERVER" >/dev/null
-    local args=(-c "$TUN_SERVER" -p "$BENCH_PORT" -t "$TIME" -J -P 4)
+    local target
+    if [[ "$BENCH_MODE" == managed ]]; then
+        remote_exec bench-server "$TXID" "$BENCH_PORT" "$TUN_SERVER" >/dev/null
+        target="$TUN_SERVER"
+    else
+        target="$BENCH_TARGET"
+    fi
+    local args=(-c "$target" -p "$BENCH_PORT" -t "$TIME" -J -P 4)
     (( reverse )) && args+=(-R)
     json_file=$(mktemp "$WORKDIR/iperf.XXXXXX.json")
     iperf3 "${args[@]}" >"$json_file" || return 1

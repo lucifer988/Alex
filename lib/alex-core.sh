@@ -119,6 +119,14 @@ alex_validate_service() {
     [[ "$1" =~ ^[A-Za-z0-9_.@-]+\.service$ && "$1" != -* ]]
 }
 
+alex_validate_remote_mode() {
+    [[ "$1" =~ ^(client|server)$ ]]
+}
+
+alex_validate_bench_mode() {
+    [[ "$1" =~ ^(managed|existing)$ ]]
+}
+
 alex_validate_managed_path() {
     local path=$1
     [[ "$path" =~ ^/(opt|etc|usr/local/etc)/[A-Za-z0-9._/+:-]+$ ]] || return 1

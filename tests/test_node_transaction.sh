@@ -6,9 +6,12 @@ TMP=$(mktemp -d)
 trap 'if [[ "${ALEX_TEST_KEEP:-0}" == 1 ]]; then echo "kept: $TMP" >&2; else rm -rf "$TMP"; fi' EXIT
 BIN="$TMP/bin"
 mkdir -p "$BIN" "$TMP/etc/openppp2" "$TMP/state" "$TMP/run" "$TMP/lock" "$TMP/net/ppp0/statistics"
+mkdir -p "$TMP/net/eth0/statistics"
 printf '0\n' >"$TMP/net/ppp0/statistics/tx_dropped"
 printf '0\n' >"$TMP/net/ppp0/statistics/rx_dropped"
 printf '1000\n' >"$TMP/net/ppp0/tx_queue_len"
+printf '0\n' >"$TMP/net/eth0/statistics/tx_dropped"
+printf '0\n' >"$TMP/net/eth0/statistics/rx_dropped"
 cat >"$TMP/etc/openppp2/appsettings.json" <<'JSON'
 {"concurrent":4,"key":{"protocol-key":"secret"},"mux":{"mode":"compat"}}
 JSON
@@ -156,4 +159,16 @@ encoded_txid=$(printf '%s' "$TXID" | base64 | tr -d '\n')
 "$HELPER" --b64 "$encoded_command" "$encoded_txid" | jq -e '.ok' >/dev/null
 "$HELPER" discard "$TXID" >/dev/null
 "$HELPER" cleanup "$TXID" >/dev/null
+
+TXID=20260720T120005Z-1234567890abcdef
+"$HELPER" prepare "$TXID" "$CONFIG" test.service eth0 server >/dev/null
+[[ "$(cat "$TMP/state/transactions/$TXID/mode")" == server ]]
+printf '%s\n' '{"concurrent":7,"key":{"protocol-key":"secret"},"mux":{"mode":"flow"}}' |
+  "$HELPER" apply "$TXID" 5000 >/dev/null
+"$HELPER" health "$TXID" | jq -e '.ok and .tun_drops == 0' >/dev/null
+"$HELPER" commit "$TXID" >/dev/null
+[[ ! -e "$TMP/etc/systemd/system/test.service.d/90-alex-tun-queue.conf" ]]
+"$HELPER" finalize "$TXID" >/dev/null
+"$HELPER" auto-rollback "$TXID" >/dev/null
+[[ ! -e "$TMP/state/transactions/$TXID" ]]
 printf 'node transaction integration: ok\n'

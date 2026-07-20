@@ -102,14 +102,19 @@ cancel_watchdog() {
 }
 
 cmd_prepare() {
-    local txid=$1 config=$2 service=$3 tun=$4
+    local txid=$1 config=$2 service=$3 tun=$4 mode=${5:-client}
     safe_txid "$txid" || die '非法事务 ID'
     safe_path "$config" || die '配置路径不在允许范围'
     safe_service "$service" || die '非法 systemd 服务名'
+    [[ "$mode" =~ ^(client|server)$ ]] || die '非法远端模式'
     [[ "$tun" =~ ^[A-Za-z0-9_.:-]+$ ]] || die '非法 TUN 接口名'
     [[ -f "$config" && ! -L "$config" ]] || die '配置文件不存在或是符号链接'
-    [[ -d "/sys/class/net/$tun" ]] || die '指定的 TUN 接口不存在'
-    [[ -r "/sys/class/net/$tun/tx_queue_len" ]] || die '无法读取 TUN 队列长度'
+    if [[ "$mode" == client ]]; then
+        [[ -d "/sys/class/net/$tun" ]] || die '指定的 TUN 接口不存在'
+        [[ -r "/sys/class/net/$tun/tx_queue_len" ]] || die '无法读取 TUN 队列长度'
+    else
+        [[ -d "/sys/class/net/$tun" ]] || die '指定的服务端统计接口不存在'
+    fi
     jq -e 'type == "object"' "$config" >/dev/null || die '配置不是有效 JSON 对象'
     systemctl cat "$service" >/dev/null || die 'systemd 服务不存在'
     systemctl is-active --quiet "$service" || die 'OpenPPP2 服务当前不是 active，拒绝调优'
@@ -132,7 +137,12 @@ cmd_prepare() {
     else
         printf 'absent\n' >"$dir/original.dropin.state"
     fi
-    cat "/sys/class/net/$tun/tx_queue_len" >"$dir/original.qlen"
+    if [[ "$mode" == client ]]; then
+        cat "/sys/class/net/$tun/tx_queue_len" >"$dir/original.qlen"
+    else
+        printf 'server-no-qlen\n' >"$dir/original.qlen"
+    fi
+    printf '%s\n' "$mode" >"$dir/mode"
     printf 'PREPARED\n' >"$dir/stage"
     install_watchdog "$txid"
     claim_transaction "$txid"
@@ -169,7 +179,7 @@ restart_and_verify() {
 }
 
 cmd_apply() {
-    local txid=$1 qlen=$2 dir config service tun owner group mode
+    local txid=$1 qlen=$2 dir config service tun owner group mode role_mode
     safe_txid "$txid" || die '非法事务 ID'
     [[ "$qlen" =~ ^(1000|5000|10000)$ ]] || die '非法 TUN 队列长度'
     dir=$(tx_dir "$txid")
@@ -180,26 +190,30 @@ cmd_apply() {
     owner=$(meta_get "$txid" owner)
     group=$(meta_get "$txid" group)
     mode=$(meta_get "$txid" mode)
+    role_mode=$(cat "$dir/mode")
     jq -e 'if type == "object" then . else error("candidate must be an object") end' >"$dir/candidate.json"
     install_candidate "$dir/candidate.json" "$config" "$owner" "$group" "$mode"
     if ! restart_and_verify "$service" "$tun"; then
         cmd_rollback "$txid" >/dev/null || true
         die '候选配置启动失败，已尝试回退'
     fi
-    ip link set dev "$tun" txqueuelen "$qlen"
+    if [[ "$role_mode" == client ]]; then
+        ip link set dev "$tun" txqueuelen "$qlen"
+    fi
     printf '%s\n' "$qlen" >"$dir/candidate.qlen"
     printf 'APPLIED\n' >"$dir/stage"
     jq -n --arg checksum "$(sha256sum "$config" | awk '{print $1}')" '{ok:true,config_sha256:$checksum}'
 }
 
 cmd_health() {
-    local txid=$1 dir service tun pid restarts cpu=0 drops=0
+    local txid=$1 dir service tun pid restarts cpu=0 drops=0 tx_drops rx_drops role_mode
     safe_txid "$txid" || die '非法事务 ID'
     dir=$(tx_dir "$txid")
     service=$(meta_get "$txid" service)
     tun=$(meta_get "$txid" tun)
+    role_mode=$(cat "$dir/mode")
     systemctl is-active --quiet "$service" || die 'openppp2 服务不活跃'
-    [[ -d "/sys/class/net/$tun" ]] || die 'TUN 接口不存在'
+    [[ -d "/sys/class/net/$tun" ]] || die '统计接口不存在'
     pid=$(systemctl show "$service" -p MainPID --value)
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die 'MainPID 无效'
     restarts=$(systemctl show "$service" -p NRestarts --value)
@@ -208,17 +222,17 @@ cmd_health() {
         cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | awk 'NF {printf "%.0f", $1+0}') || die 'CPU 使用率读取失败'
         [[ "$cpu" =~ ^[0-9]+$ ]] || die 'CPU 使用率无法解析'
     fi
-    local tx_drops rx_drops
-    tx_drops=$(cat "/sys/class/net/$tun/statistics/tx_dropped") || die 'TUN tx_dropped 读取失败'
-    rx_drops=$(cat "/sys/class/net/$tun/statistics/rx_dropped") || die 'TUN rx_dropped 读取失败'
-    [[ "$tx_drops" =~ ^[0-9]+$ && "$rx_drops" =~ ^[0-9]+$ ]] || die 'TUN 丢包计数无法解析'
+    tx_drops=$(cat "/sys/class/net/$tun/statistics/tx_dropped") || die '统计接口 tx_dropped 读取失败'
+    rx_drops=$(cat "/sys/class/net/$tun/statistics/rx_dropped") || die '统计接口 rx_dropped 读取失败'
+    [[ "$tx_drops" =~ ^[0-9]+$ && "$rx_drops" =~ ^[0-9]+$ ]] || die '统计接口丢包计数无法解析'
     drops=$((tx_drops + rx_drops))
     jq -n --argjson pid "$pid" --argjson cpu "${cpu:-0}" --argjson drops "$drops" --argjson restarts "${restarts:-0}" \
         '{ok:true,pid:$pid,cpu_percent:$cpu,tun_drops:$drops,restarts:$restarts}'
 }
 
+
 cmd_restore_original() {
-    local txid=$1 dir config service tun owner group mode qlen dropin_owner dropin_group dropin_mode
+    local txid=$1 dir config service tun owner group mode qlen dropin_owner dropin_group dropin_mode role_mode
     safe_txid "$txid" || die '非法事务 ID'
     dir=$(tx_dir "$txid")
     [[ -f "$dir/original.json" ]] || die '找不到原始备份'
@@ -228,26 +242,31 @@ cmd_restore_original() {
     owner=$(meta_get "$txid" owner)
     group=$(meta_get "$txid" group)
     mode=$(meta_get "$txid" mode)
+    role_mode=$(cat "$dir/mode")
     qlen=$(cat "$dir/original.qlen")
-    if ! [[ "$qlen" =~ ^[0-9]+$ ]] || (( qlen > 4294967295 )); then
+    if [[ "$role_mode" == client ]] && { ! [[ "$qlen" =~ ^[0-9]+$ ]] || (( qlen > 4294967295 )); }; then
         die '原始 TUN 队列长度无效'
     fi
     install_candidate "$dir/original.json" "$config" "$owner" "$group" "$mode"
-    local dropin_dir="/etc/systemd/system/${service}.d"
-    local dropin="$dropin_dir/90-alex-tun-queue.conf"
-    if [[ "$(cat "$dir/original.dropin.state")" == present ]]; then
-        read -r dropin_owner dropin_group dropin_mode <"$dir/original.dropin.meta"
-        [[ "$dropin_owner" =~ ^[0-9]+$ && "$dropin_group" =~ ^[0-9]+$ && "$dropin_mode" =~ ^[0-7]{3,4}$ ]] ||
-            die '原 systemd drop-in 元数据无效'
-        install -d -m 0755 "$dropin_dir"
-        install -o "$dropin_owner" -g "$dropin_group" -m "$dropin_mode" "$dir/original.dropin" "$dropin.alex-new"
-        mv -f "$dropin.alex-new" "$dropin"
-    else
-        rm -f -- "$dropin"
+    if [[ "$role_mode" == client ]]; then
+        local dropin_dir="/etc/systemd/system/${service}.d"
+        local dropin="$dropin_dir/90-alex-tun-queue.conf"
+        if [[ "$(cat "$dir/original.dropin.state")" == present ]]; then
+            read -r dropin_owner dropin_group dropin_mode <"$dir/original.dropin.meta"
+            [[ "$dropin_owner" =~ ^[0-9]+$ && "$dropin_group" =~ ^[0-9]+$ && "$dropin_mode" =~ ^[0-7]{3,4}$ ]] ||
+                die '原 systemd drop-in 元数据无效'
+            install -d -m 0755 "$dropin_dir"
+            install -o "$dropin_owner" -g "$dropin_group" -m "$dropin_mode" "$dir/original.dropin" "$dropin.alex-new"
+            mv -f "$dropin.alex-new" "$dropin"
+        else
+            rm -f -- "$dropin"
+        fi
     fi
     systemctl daemon-reload
     restart_and_verify "$service" "$tun" || die '恢复原配置后服务未恢复'
-    ip link set dev "$tun" txqueuelen "$qlen"
+    if [[ "$role_mode" == client ]]; then
+        ip link set dev "$tun" txqueuelen "$qlen"
+    fi
     printf 'RESTORED\n' >"$dir/stage"
     jq -n '{ok:true,restored:true}'
 }
@@ -255,33 +274,36 @@ cmd_restore_original() {
 cmd_rollback() { cmd_restore_original "$1"; }
 
 cmd_commit() {
-    local txid=$1 dir config service tun checksum ip_bin qlen dropin dropin_stage
+    local txid=$1 dir config service tun checksum ip_bin qlen dropin dropin_stage role_mode
     safe_txid "$txid" || die '非法事务 ID'
     dir=$(tx_dir "$txid")
     config=$(meta_get "$txid" config)
     service=$(meta_get "$txid" service)
     tun=$(meta_get "$txid" tun)
+    role_mode=$(cat "$dir/mode")
     [[ -f "$dir/candidate.json" ]] || die '没有可提交候选'
-    if [[ -x /usr/sbin/ip ]]; then ip_bin=/usr/sbin/ip
-    elif [[ -x /sbin/ip ]]; then ip_bin=/sbin/ip
-    else die '找不到受信任的系统 ip 命令'
-    fi
     checksum=$(sha256sum "$config" | awk '{print $1}')
     [[ "$checksum" == "$(sha256sum "$dir/candidate.json" | awk '{print $1}')" ]] || die '运行配置和最优候选不一致'
     qlen=$(cat "$dir/candidate.qlen")
-    [[ "$qlen" =~ ^(1000|5000|10000)$ ]] || die '候选 TUN 队列长度无效'
-    install -d -m 0755 "/etc/systemd/system/${service}.d"
-    dropin="/etc/systemd/system/${service}.d/90-alex-tun-queue.conf"
-    dropin_stage="$dir/committed.dropin"
-    cat >"$dropin_stage" <<EOF
+    if [[ "$role_mode" == client ]]; then
+        if [[ -x /usr/sbin/ip ]]; then ip_bin=/usr/sbin/ip
+        elif [[ -x /sbin/ip ]]; then ip_bin=/sbin/ip
+        else die '找不到受信任的系统 ip 命令'
+        fi
+        [[ "$qlen" =~ ^(1000|5000|10000)$ ]] || die '候选 TUN 队列长度无效'
+        install -d -m 0755 "/etc/systemd/system/${service}.d"
+        dropin="/etc/systemd/system/${service}.d/90-alex-tun-queue.conf"
+        dropin_stage="$dir/committed.dropin"
+        cat >"$dropin_stage" <<EOF
 [Service]
 ExecStartPost=${ip_bin} link set dev ${tun} txqueuelen ${qlen}
 EOF
-    install -o 0 -g 0 -m 0644 "$dropin_stage" "$dropin.alex-new"
-    mv -f "$dropin.alex-new" "$dropin"
+        install -o 0 -g 0 -m 0644 "$dropin_stage" "$dropin.alex-new"
+        mv -f "$dropin.alex-new" "$dropin"
+    fi
     systemctl daemon-reload
     restart_and_verify "$service" "$tun" || {
-        rm -f "$dropin"
+        if [[ "$role_mode" == client ]]; then rm -f "$dropin"; fi
         systemctl daemon-reload
         cmd_rollback "$txid" >/dev/null || true
         die '持久化重启验证失败，已回退'
@@ -414,7 +436,7 @@ main() {
         set -- "${decoded[@]:1}"
     fi
     case "$command" in
-        prepare) (($# == 4)) || die 'prepare 参数错误'; cmd_prepare "$@" ;;
+        prepare) (($# == 4 || $# == 5)) || die 'prepare 参数错误'; cmd_prepare "$@" ;;
         apply) (($# == 2)) || die 'apply 参数错误'; cmd_apply "$@" ;;
         health) (($# == 1)) || die 'health 参数错误'; cmd_health "$@" ;;
         restore|rollback) (($# == 1)) || die 'restore 参数错误'; cmd_restore_original "$@" ;;
