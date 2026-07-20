@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+SELF_PATH=$(readlink -f "${BASH_SOURCE[0]}")
+SELF_DIR=$(cd "$(dirname "$SELF_PATH")" && pwd)
+LIB=${ALEX_LIB:-$SELF_DIR/lib/alex-core.sh}
+NODE_HELPER=${ALEX_NODE_HELPER:-$SELF_DIR/alex-node}
+# shellcheck source=lib/alex-core.sh
+source "$LIB"
+
+DOWNLOAD_CAP=1000
+UPLOAD_CAP=60
+SSH_USER=root
+SSH_PORT=22
+SSH_KEY=
+SSH_KNOWN_HOSTS=${ALEX_KNOWN_HOSTS:-/etc/alex/known_hosts}
+SSH_HOST=
+LOCAL_CONFIG=/opt/openppp2/appsettings.json
+REMOTE_CONFIG=/opt/openppp2/appsettings.json
+LOCAL_SERVICE=openppp2-client.service
+REMOTE_SERVICE=openppp2-server.service
+LOCAL_TUN=ppp0
+REMOTE_TUN=ppp0
+TUN_SERVER=10.0.0.1
+BENCH_PORT=5201
+TIME=15
+REPEATS=3
+YES=0
+DRY_RUN=0
+TXID=
+WORKDIR=
+BEST_LOCAL=
+BEST_REMOTE=
+REMOTE_HELPER=
+LOCAL_PREPARED=0
+REMOTE_PREPARED=0
+COMMITTED=0
+
+log() { printf '[alex] %s\n' "$*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+usage() {
+    cat <<'EOF'
+Alex - OpenPPP2 双端自动调优
+
+用法：
+  sudo alex detect --ssh-host HOST --ssh-key KEY [选项]
+  sudo alex optimize --ssh-host HOST --ssh-key KEY [选项]
+  sudo alex rollback --transaction ID --ssh-host HOST --ssh-key KEY [选项]
+
+关键选项：
+  --ssh-host HOST                 OpenPPP2 服务端 SSH 地址
+  --ssh-user USER                 默认 root
+  --ssh-port PORT                 默认 22
+  --ssh-key PATH                  SSH 私钥，生产模式必需
+  --known-hosts PATH              专用 known_hosts，默认 /etc/alex/known_hosts
+  --local-config PATH             客户端配置
+  --remote-config PATH            服务端配置
+  --local-service UNIT            客户端 systemd 服务
+  --remote-service UNIT           服务端 systemd 服务
+  --tun-server IP                 隧道内服务端地址，默认 10.0.0.1
+  --download-cap MBPS             默认且最大评分目标 1000
+  --upload-cap MBPS               默认且最大评分目标 60
+  --time SEC                      单次测速时长，默认 15
+  --repeats N                     每个方向次数，默认 3
+  --yes                           非交互确认
+  --dry-run                       只检测并列出候选，不修改
+EOF
+}
+
+parse_args() {
+    COMMAND=${1:-}
+    shift || true
+    while (($#)); do
+        case "$1" in
+            --ssh-host) SSH_HOST=$2; shift 2 ;;
+            --ssh-user) SSH_USER=$2; shift 2 ;;
+            --ssh-port) SSH_PORT=$2; shift 2 ;;
+            --ssh-key) SSH_KEY=$2; shift 2 ;;
+            --known-hosts) SSH_KNOWN_HOSTS=$2; shift 2 ;;
+            --local-config) LOCAL_CONFIG=$2; shift 2 ;;
+            --remote-config) REMOTE_CONFIG=$2; shift 2 ;;
+            --local-service) LOCAL_SERVICE=$2; shift 2 ;;
+            --remote-service) REMOTE_SERVICE=$2; shift 2 ;;
+            --local-tun) LOCAL_TUN=$2; shift 2 ;;
+            --remote-tun) REMOTE_TUN=$2; shift 2 ;;
+            --tun-server) TUN_SERVER=$2; shift 2 ;;
+            --bench-port) BENCH_PORT=$2; shift 2 ;;
+            --download-cap) DOWNLOAD_CAP=$2; shift 2 ;;
+            --upload-cap) UPLOAD_CAP=$2; shift 2 ;;
+            --time) TIME=$2; shift 2 ;;
+            --repeats) REPEATS=$2; shift 2 ;;
+            --transaction) TXID=$2; shift 2 ;;
+            --yes) YES=1; shift ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "未知参数: $1" ;;
+        esac
+    done
+}
+
+validate() {
+    (( EUID == 0 )) || die '必须以 root 运行'
+    [[ "$COMMAND" =~ ^(detect|optimize|rollback)$ ]] || { usage; exit 2; }
+    alex_validate_ssh_target "$SSH_USER" "$SSH_HOST" "$SSH_PORT" || die 'SSH 目标参数非法'
+    alex_validate_managed_path "$LOCAL_CONFIG" || die '本地配置路径非法'
+    alex_validate_managed_path "$REMOTE_CONFIG" || die '远端配置路径非法'
+    [[ "$LOCAL_SERVICE" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || die '本地服务名非法'
+    [[ "$REMOTE_SERVICE" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || die '远端服务名非法'
+    if ! [[ "$DOWNLOAD_CAP" =~ ^[0-9]+$ ]] || (( DOWNLOAD_CAP < 1 || DOWNLOAD_CAP > 1000 )); then die '下载上限必须为 1-1000 Mbps'; fi
+    if ! [[ "$UPLOAD_CAP" =~ ^[0-9]+$ ]] || (( UPLOAD_CAP < 1 || UPLOAD_CAP > 60 )); then die '上传上限必须为 1-60 Mbps'; fi
+    if ! [[ "$TIME" =~ ^[0-9]+$ ]] || (( TIME < 5 || TIME > 120 )); then die '测速时间必须为 5-120 秒'; fi
+    if ! [[ "$REPEATS" =~ ^[0-9]+$ ]] || (( REPEATS < 3 || REPEATS > 7 )); then die '重复次数必须为 3-7'; fi
+    if ! [[ "$BENCH_PORT" =~ ^[0-9]+$ ]] || (( BENCH_PORT < 5201 || BENCH_PORT > 5299 )); then die '测速端口必须为 5201-5299'; fi
+    [[ -f "$NODE_HELPER" && -f "$LIB" ]] || die '安装不完整：缺少 helper/core'
+    [[ -n "$SSH_KEY" && -f "$SSH_KEY" ]] || die '必须提供存在的 --ssh-key'
+    [[ -f "$SSH_KNOWN_HOSTS" ]] || die "known_hosts 不存在: $SSH_KNOWN_HOSTS；请先用 ssh-keyscan 后带外核对指纹"
+    command -v iperf3 >/dev/null || die '本机缺少 iperf3'
+    command -v jq >/dev/null || die '本机缺少 jq'
+}
+
+ssh_args() {
+    SSH_ARGS=(-p "$SSH_PORT" -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes
+        -o "UserKnownHostsFile=$SSH_KNOWN_HOSTS" -o IdentitiesOnly=yes -o ConnectTimeout=10
+        -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ForwardAgent=no
+        -o ClearAllForwardings=yes -o RequestTTY=no)
+}
+
+remote_exec() {
+    ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo -- "$REMOTE_HELPER" "$@"
+}
+
+upload_helper() {
+    REMOTE_HELPER="/usr/local/libexec/alex-node-${TXID}"
+    ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo install -d -m 0755 /usr/local/libexec
+    ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo install -m 0700 /dev/stdin "$REMOTE_HELPER" <"$NODE_HELPER"
+    local local_sha remote_sha
+    local_sha=$(sha256sum "$NODE_HELPER" | awk '{print $1}')
+    remote_sha=$(ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo -- sha256sum -- "$REMOTE_HELPER" | awk '{print $1}')
+    [[ "$local_sha" == "$remote_sha" ]] || die '远端 helper 校验和不匹配'
+}
+
+remove_remote_helper() {
+    [[ -n "$REMOTE_HELPER" ]] || return 0
+    ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo rm -f -- "$REMOTE_HELPER" 2>/dev/null || true
+}
+
+cleanup_committed_pair() {
+    local failed=0 attempt
+    for attempt in 1 2 3; do
+        if remote_exec cleanup "$TXID" >/dev/null; then failed=0; break; fi
+        failed=1
+        sleep "$attempt"
+    done
+    if ! "$NODE_HELPER" cleanup "$TXID" >/dev/null; then
+        failed=1
+    fi
+    (( failed == 0 )) || die '最优配置已验证并保留，但事务资料清理不完整；不会回滚已提交配置'
+}
+
+cleanup() {
+    local rc=$?
+    if (( rc != 0 && COMMITTED == 0 )); then
+        log '事务未提交，执行双端保护性回退'
+        if (( LOCAL_PREPARED )); then "$NODE_HELPER" restore "$TXID" >/dev/null 2>&1 || true; fi
+        if (( REMOTE_PREPARED )); then remote_exec restore "$TXID" >/dev/null 2>&1 || true; fi
+    fi
+    remove_remote_helper
+    alex_cleanup
+    exit "$rc"
+}
+
+prepare_transaction() {
+    TXID=${TXID:-$(alex_transaction_id)}
+    WORKDIR=$(mktemp -d "/run/alex-coordinator.${TXID}.XXXXXX")
+    alex_register_cleanup "$WORKDIR"
+    upload_helper
+    "$NODE_HELPER" prepare "$TXID" "$LOCAL_CONFIG" "$LOCAL_SERVICE" "$LOCAL_TUN" >/dev/null
+    LOCAL_PREPARED=1
+    remote_exec prepare "$TXID" "$REMOTE_CONFIG" "$REMOTE_SERVICE" "$REMOTE_TUN" >/dev/null
+    REMOTE_PREPARED=1
+    install -m 0600 "$LOCAL_CONFIG" "$WORKDIR/base-local.json"
+    ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo cat -- "$REMOTE_CONFIG" >"$WORKDIR/base-remote.json"
+    jq -e 'type == "object"' "$WORKDIR/base-remote.json" >/dev/null
+}
+
+config_values() {
+    jq -r '[.concurrent // 4, .mux.mode // "compat", .mux.turbo // false,
+        .mux.tx.queue.max // 4096, .mux.tx.queue.stall // 8000,
+        .mux.flow.reorder.bytes // 1048576, .mux.flow.reorder.timeout // 400] | @tsv' "$1"
+}
+
+apply_pair() {
+    local candidate_local=$1 candidate_remote=$2 qlen=$3
+    "$NODE_HELPER" apply "$TXID" "$qlen" <"$candidate_local" >/dev/null
+    if ! remote_exec apply "$TXID" "$qlen" <"$candidate_remote" >/dev/null; then
+        "$NODE_HELPER" restore "$TXID" >/dev/null || true
+        return 1
+    fi
+}
+
+health_pair() {
+    local local_health remote_health
+    local_health=$("$NODE_HELPER" health "$TXID")
+    remote_health=$(remote_exec health "$TXID")
+    jq -e '.ok and .restarts >= 0' <<<"$local_health" >/dev/null
+    jq -e '.ok and .restarts >= 0' <<<"$remote_health" >/dev/null
+    jq -n --argjson l "$local_health" --argjson r "$remote_health" \
+        '{cpu_percent:([$l.cpu_percent,$r.cpu_percent]|max),drops:($l.tun_drops+$r.tun_drops)}'
+}
+
+iperf_sample() {
+    local reverse=$1 json bps retrans
+    remote_exec bench-server "$BENCH_PORT" "$TUN_SERVER" >/dev/null
+    local args=(-c "$TUN_SERVER" -p "$BENCH_PORT" -t "$TIME" -J -P 4)
+    (( reverse )) && args+=(-R)
+    json=$(iperf3 "${args[@]}") || return 1
+    bps=$(jq -r '.end.sum_received.bits_per_second // .end.sum.bits_per_second // 0' <<<"$json")
+    retrans=$(jq -r '.end.sum_sent.retransmits // 0' <<<"$json")
+    awk -v bps="$bps" -v r="$retrans" 'BEGIN {printf "%.3f %d\n", bps/1000000, r}'
+}
+
+benchmark() {
+    local downloads=() uploads=() retrans=0 value r i health_before health_after cpu drops_before drops_after drops score
+    health_before=$(health_pair) || return 1
+    for ((i=0; i<REPEATS; i++)); do
+        read -r value r < <(iperf_sample 1) || return 1
+        downloads+=("$value"); retrans=$((retrans + r))
+        read -r value r < <(iperf_sample 0) || return 1
+        uploads+=("$value"); retrans=$((retrans + r))
+    done
+    health_after=$(health_pair) || return 1
+    cpu=$(jq -r '.cpu_percent' <<<"$health_after")
+    drops_before=$(jq -r '.drops' <<<"$health_before")
+    drops_after=$(jq -r '.drops' <<<"$health_after")
+    drops=$((drops_after - drops_before))
+    local download upload
+    download=$(alex_median "${downloads[@]}")
+    upload=$(alex_median "${uploads[@]}")
+    score=$(alex_score "$download" "$upload" "$retrans" 0 "$cpu" "$drops" "$DOWNLOAD_CAP" "$UPLOAD_CAP")
+    jq -n --argjson download "$download" --argjson upload "$upload" --argjson retrans "$retrans" \
+        --argjson cpu "$cpu" --argjson drops "$drops" --argjson score "$score" \
+        '{download_mbps:$download,upload_mbps:$upload,retransmits:$retrans,cpu_percent:$cpu,tun_drops:$drops,score:$score}'
+}
+
+restore_pair() {
+    "$NODE_HELPER" restore "$TXID" >/dev/null
+    remote_exec restore "$TXID" >/dev/null
+}
+
+optimize() {
+    prepare_transaction
+    local values concurrent mode turbo queue_max queue_stall reorder_bytes reorder_timeout qlen
+    values=$(config_values "$WORKDIR/base-local.json")
+    read -r concurrent mode turbo queue_max queue_stall reorder_bytes reorder_timeout <<<"$values"
+    if (( DRY_RUN )); then
+        alex_candidate_plan "$concurrent" "$mode" "$turbo" "$queue_max" "$queue_stall" "$reorder_bytes" "$reorder_timeout"
+        "$NODE_HELPER" discard "$TXID" >/dev/null
+        remote_exec discard "$TXID" >/dev/null
+        "$NODE_HELPER" cleanup "$TXID" >/dev/null
+        remote_exec cleanup "$TXID" >/dev/null
+        COMMITTED=1
+        return
+    fi
+    if (( YES == 0 )); then
+        printf '将临时重启客户端和服务端多次，最终仅保存最优解。输入 YES 继续: ' >&2
+        read -r answer
+        [[ "$answer" == YES ]] || die '用户取消'
+    fi
+
+    local best_score=-1 index=0 result candidate_local candidate_remote
+    while read -r concurrent mode turbo queue_max queue_stall reorder_bytes reorder_timeout qlen; do
+        index=$((index + 1))
+        candidate_local="$WORKDIR/local-$index.json"
+        candidate_remote="$WORKDIR/remote-$index.json"
+        alex_apply_candidate "$WORKDIR/base-local.json" "$candidate_local" "$concurrent" "$mode" "$turbo" \
+            "$queue_max" "$queue_stall" "$reorder_bytes" "$reorder_timeout"
+        alex_apply_candidate "$WORKDIR/base-remote.json" "$candidate_remote" "$concurrent" "$mode" "$turbo" \
+            "$queue_max" "$queue_stall" "$reorder_bytes" "$reorder_timeout"
+        log "候选 $index: concurrent=$concurrent mux=$mode turbo=$turbo queue=$queue_max qlen=$qlen"
+        if ! apply_pair "$candidate_local" "$candidate_remote" "$qlen"; then
+            log "候选 $index 应用失败，跳过"
+            restore_pair
+            continue
+        fi
+        sleep 5
+        if ! result=$(benchmark); then
+            log "候选 $index 验证失败，回退"
+            restore_pair
+            continue
+        fi
+        log "候选 $index: $(jq -c . <<<"$result")"
+        local score
+        score=$(jq -r '.score' <<<"$result")
+        printf '%s\n' "$result" >"$WORKDIR/result-$index.json"
+        if (( score > best_score )); then
+            best_score=$score
+            BEST_LOCAL="$WORKDIR/best-local.json"
+            BEST_REMOTE="$WORKDIR/best-remote.json"
+            install -m 0600 "$candidate_local" "$BEST_LOCAL"
+            install -m 0600 "$candidate_remote" "$BEST_REMOTE"
+            printf '%s\n' "$qlen" >"$WORKDIR/best.qlen"
+            printf '%s\n' "$result" >"$WORKDIR/best-result.json"
+        fi
+        restore_pair
+    done < <(alex_candidate_plan "$concurrent" "$mode" "$turbo" "$queue_max" "$queue_stall" "$reorder_bytes" "$reorder_timeout")
+
+    (( best_score >= 0 )) || die '没有候选通过稳定性验证，原配置已恢复'
+    qlen=$(cat "$WORKDIR/best.qlen")
+    apply_pair "$BEST_LOCAL" "$BEST_REMOTE" "$qlen" || die '重新应用最优候选失败'
+    result=$(benchmark) || die '最优候选提交前复验失败'
+    "$NODE_HELPER" commit "$TXID" >/dev/null
+    remote_exec commit "$TXID" >/dev/null
+    result=$(benchmark) || die '持久化重启后的最终复验失败'
+    COMMITTED=1
+    cleanup_committed_pair
+    jq -n --arg transaction "$TXID" --argjson result "$result" \
+        '{ok:true,transaction:$transaction,persisted:true,result:$result}'
+}
+
+detect() {
+    prepare_transaction
+    local result
+    result=$(benchmark)
+    "$NODE_HELPER" discard "$TXID" >/dev/null
+    remote_exec discard "$TXID" >/dev/null
+    "$NODE_HELPER" cleanup "$TXID" >/dev/null
+    remote_exec cleanup "$TXID" >/dev/null
+    COMMITTED=1
+    printf '%s\n' "$result"
+}
+
+rollback() {
+    [[ -n "$TXID" ]] || die 'rollback 需要 --transaction ID'
+    upload_helper
+    "$NODE_HELPER" rollback "$TXID"
+    remote_exec rollback "$TXID"
+    COMMITTED=1
+}
+
+main() {
+    if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then
+        usage
+        exit 0
+    fi
+    parse_args "$@"
+    validate
+    ssh_args
+    trap cleanup EXIT INT TERM HUP
+    case "$COMMAND" in
+        detect) detect ;;
+        optimize) optimize ;;
+        rollback) rollback ;;
+    esac
+}
+
+main "$@"

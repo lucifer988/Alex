@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
+      - name: Unit tests
+        run: |
+          bash tests/test_alex.sh
+          bash tests/test_node_transaction.sh
+      - name: Shell syntax
+        run: bash -n alex alex-node install.sh lib/alex-core.sh tests/test_alex.sh tests/test_node_transaction.sh
+      - name: ShellCheck
+        run: shellcheck -x -e SC1091,SC2029,SC2034 alex alex-node install.sh lib/alex-core.sh tests/test_alex.sh tests/test_node_transaction.sh
+      - name: Isolated install smoke test
+        run: |
+          root=$(mktemp -d)
+          PREFIX="$root/usr/local" ALEX_ETC_DIR="$root/etc/alex" sudo -E bash install.sh
+          test -L "$root/usr/local/sbin/alex"
+          "$root/usr/local/sbin/alex" --help | grep -q 'OpenPPP2 双端自动调优'
+          rm -rf "$root"
+      - name: Diff hygiene
+        run: git diff --check
