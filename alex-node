@@ -19,7 +19,7 @@ run_dir() { printf '%s/%s' "$RUN_ROOT" "$1"; }
 require_root() { (( EUID == 0 )) || die '必须以 root 运行'; }
 require_tools() {
     local tool
-    for tool in flock jq systemctl sha256sum install ip stat; do
+    for tool in awk base64 cat flock grep jq ps seq sleep systemctl systemd-run sha256sum install ip stat ss sync tr; do
         command -v "$tool" >/dev/null || die "缺少依赖: $tool"
     done
 }
@@ -38,6 +38,13 @@ claim_transaction() {
     fi
     printf '%s\n' "$txid" >"$marker.new"
     mv -f "$marker.new" "$marker"
+}
+
+check_transaction_available() {
+    local txid=$1 marker="$STATE_ROOT/active-transaction"
+    if [[ -f "$marker" && "$(cat "$marker")" != "$txid" ]]; then
+        die "另一事务仍处于活动状态: $(cat "$marker")"
+    fi
 }
 
 release_transaction() {
@@ -77,7 +84,7 @@ install_watchdog() {
     unit=$(watchdog_unit "$txid")
     install -m 0700 "$0" "$helper"
     command -v systemd-run >/dev/null || die '缺少 systemd-run，无法安装断线回退保护'
-    systemd-run --quiet --unit "$unit" --on-active=45m --timer-property=AccuracySec=10s \
+    systemd-run --quiet --unit "$unit" --on-active=4h --timer-property=AccuracySec=10s \
         "$helper" auto-rollback "$txid"
     printf '%s\n' "$unit" >"$dir/watchdog.unit"
 }
@@ -98,10 +105,15 @@ cmd_prepare() {
     safe_service "$service" || die '非法 systemd 服务名'
     [[ "$tun" =~ ^[A-Za-z0-9_.:-]+$ ]] || die '非法 TUN 接口名'
     [[ -f "$config" && ! -L "$config" ]] || die '配置文件不存在或是符号链接'
+    [[ -d "/sys/class/net/$tun" ]] || die '指定的 TUN 接口不存在'
+    [[ -r "/sys/class/net/$tun/tx_queue_len" ]] || die '无法读取 TUN 队列长度'
     jq -e 'type == "object"' "$config" >/dev/null || die '配置不是有效 JSON 对象'
     systemctl cat "$service" >/dev/null || die 'systemd 服务不存在'
-    claim_transaction "$txid"
-
+    systemctl is-active --quiet "$service" || die 'OpenPPP2 服务当前不是 active，拒绝调优'
+    check_transaction_available "$txid"
+    local dropin="/etc/systemd/system/${service}.d/90-alex-tun-queue.conf"
+    [[ ! -L "$dropin" ]] || die '现有 Alex systemd drop-in 是符号链接，拒绝修改'
+    [[ ! -e "$dropin" || -f "$dropin" ]] || die '现有 Alex systemd drop-in 不是普通文件，拒绝修改'
     local dir run
     dir=$(tx_dir "$txid")
     run=$(run_dir "$txid")
@@ -109,20 +121,16 @@ cmd_prepare() {
     install -m 0600 "$config" "$dir/original.json"
     write_meta "$txid" "$config" "$service" "$tun"
     systemctl cat "$service" >"$dir/service.effective"
-    local dropin="/etc/systemd/system/${service}.d/90-alex-tun-queue.conf"
     if [[ -f "$dropin" && ! -L "$dropin" ]]; then
         install -m 0600 "$dropin" "$dir/original.dropin"
         printf 'present\n' >"$dir/original.dropin.state"
     else
         printf 'absent\n' >"$dir/original.dropin.state"
     fi
-    if [[ -e "/sys/class/net/$tun/tx_queue_len" ]]; then
-        cat "/sys/class/net/$tun/tx_queue_len" >"$dir/original.qlen"
-    else
-        printf '1000\n' >"$dir/original.qlen"
-    fi
+    cat "/sys/class/net/$tun/tx_queue_len" >"$dir/original.qlen"
     printf 'PREPARED\n' >"$dir/stage"
     install_watchdog "$txid"
+    claim_transaction "$txid"
     jq -n --arg txid "$txid" --arg checksum "$(sha256sum "$dir/original.json" | awk '{print $1}')" \
         '{ok:true,transaction:$txid,backup_sha256:$checksum}'
 }
@@ -190,8 +198,16 @@ cmd_health() {
     pid=$(systemctl show "$service" -p MainPID --value)
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die 'MainPID 无效'
     restarts=$(systemctl show "$service" -p NRestarts --value)
-    if command -v ps >/dev/null; then cpu=$(ps -p "$pid" -o %cpu= | awk '{printf "%.0f", $1+0}'); fi
-    drops=$(( $(cat "/sys/class/net/$tun/statistics/tx_dropped") + $(cat "/sys/class/net/$tun/statistics/rx_dropped") ))
+    [[ "$restarts" =~ ^[0-9]+$ ]] || die 'NRestarts 无法解析'
+    if command -v ps >/dev/null; then
+        cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | awk 'NF {printf "%.0f", $1+0}') || die 'CPU 使用率读取失败'
+        [[ "$cpu" =~ ^[0-9]+$ ]] || die 'CPU 使用率无法解析'
+    fi
+    local tx_drops rx_drops
+    tx_drops=$(cat "/sys/class/net/$tun/statistics/tx_dropped") || die 'TUN tx_dropped 读取失败'
+    rx_drops=$(cat "/sys/class/net/$tun/statistics/rx_dropped") || die 'TUN rx_dropped 读取失败'
+    [[ "$tx_drops" =~ ^[0-9]+$ && "$rx_drops" =~ ^[0-9]+$ ]] || die 'TUN 丢包计数无法解析'
+    drops=$((tx_drops + rx_drops))
     jq -n --argjson cpu "${cpu:-0}" --argjson drops "$drops" --argjson restarts "${restarts:-0}" \
         '{ok:true,cpu_percent:$cpu,tun_drops:$drops,restarts:$restarts}'
 }
@@ -228,19 +244,23 @@ cmd_restore_original() {
 cmd_rollback() { cmd_restore_original "$1"; }
 
 cmd_commit() {
-    local txid=$1 dir config service tun checksum
+    local txid=$1 dir config service tun checksum ip_bin
     safe_txid "$txid" || die '非法事务 ID'
     dir=$(tx_dir "$txid")
     config=$(meta_get "$txid" config)
     service=$(meta_get "$txid" service)
     tun=$(meta_get "$txid" tun)
     [[ -f "$dir/candidate.json" ]] || die '没有可提交候选'
+    if [[ -x /usr/sbin/ip ]]; then ip_bin=/usr/sbin/ip
+    elif [[ -x /sbin/ip ]]; then ip_bin=/sbin/ip
+    else die '找不到受信任的系统 ip 命令'
+    fi
     checksum=$(sha256sum "$config" | awk '{print $1}')
     [[ "$checksum" == "$(sha256sum "$dir/candidate.json" | awk '{print $1}')" ]] || die '运行配置和最优候选不一致'
     install -d -m 0755 "/etc/systemd/system/${service}.d"
     cat >"/etc/systemd/system/${service}.d/90-alex-tun-queue.conf.alex-new" <<EOF
 [Service]
-ExecStartPost=/sbin/ip link set dev ${tun} txqueuelen $(cat "$dir/candidate.qlen")
+ExecStartPost=${ip_bin} link set dev ${tun} txqueuelen $(cat "$dir/candidate.qlen")
 EOF
     mv -f "/etc/systemd/system/${service}.d/90-alex-tun-queue.conf.alex-new" "/etc/systemd/system/${service}.d/90-alex-tun-queue.conf"
     systemctl daemon-reload
@@ -256,8 +276,27 @@ EOF
     jq -n --arg checksum "$checksum" '{ok:true,committed:true,config_sha256:$checksum}'
 }
 
+cmd_finalize() {
+    local txid=$1 dir
+    safe_txid "$txid" || die '非法事务 ID'
+    dir=$(tx_dir "$txid")
+    [[ -f "$dir/meta.json" ]] || die '事务不存在'
+    [[ "$(jq -r '.committed' "$dir/meta.json")" == true ]] || die '事务尚未提交，不能 finalize'
+    cancel_watchdog "$txid"
+    printf 'FINALIZED\n' >"$dir/stage"
+    jq -n '{ok:true,finalized:true}'
+}
+
 cmd_auto_rollback() {
-    local txid=$1
+    local txid=$1 dir stage
+    safe_txid "$txid" || die '非法事务 ID'
+    dir=$(tx_dir "$txid")
+    [[ -f "$dir/stage" ]] || exit 0
+    stage=$(cat "$dir/stage")
+    if [[ "$stage" == FINALIZED ]]; then
+        cmd_cleanup "$txid" >/dev/null
+        return 0
+    fi
     cmd_restore_original "$txid" >/dev/null
     cmd_cleanup "$txid" >/dev/null
 }
@@ -277,21 +316,37 @@ cmd_cleanup() {
     dir=$(tx_dir "$txid")
     [[ -f "$dir/meta.json" ]] || exit 0
     [[ "$(jq -r '.committed' "$dir/meta.json")" == true || "$(cat "$dir/stage")" == RESTORED ]] || die '未提交或未回退，拒绝清理恢复材料'
+    stop_bench_server "$txid"
     cancel_watchdog "$txid"
     rm -rf -- "$(run_dir "$txid")" "$dir"
     release_transaction "$txid"
     jq -n '{ok:true,cleaned:true}'
 }
 
+stop_bench_server() {
+    local txid=$1 pidfile pid
+    pidfile="$(run_dir "$txid")/iperf3.pid"
+    [[ -f "$pidfile" ]] || return 0
+    pid=$(cat "$pidfile" 2>/dev/null || true)
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && [[ -r "/proc/$pid/comm" ]] && [[ "$(cat "/proc/$pid/comm")" == iperf3 ]]; then
+        kill "$pid" 2>/dev/null || true
+    fi
+    rm -f -- "$pidfile"
+}
+
 cmd_bench_server() {
-    local port=$1 bind=$2
+    local txid=$1 port=$2 bind=$3 pidfile
+    safe_txid "$txid" || die '非法事务 ID'
+    [[ -f "$(tx_dir "$txid")/meta.json" ]] || die '测速事务不存在'
     if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 5201 || port > 5299 )); then
         die '测速端口必须在 5201-5299'
     fi
     [[ "$bind" =~ ^[0-9a-fA-F:.]+$ ]] || die '非法测速监听地址'
     command -v iperf3 >/dev/null || die '远端缺少 iperf3'
-    pkill -f "iperf3 -s -1 -p ${port}" 2>/dev/null || true
-    iperf3 -s -1 -p "$port" -B "$bind" -D
+    stop_bench_server "$txid"
+    ss -lnt "sport = :$port" | grep -q ":$port" && die '测速端口已被占用，拒绝终止其他进程'
+    pidfile="$(run_dir "$txid")/iperf3.pid"
+    iperf3 -s -1 -p "$port" -B "$bind" -D -I "$pidfile"
     local _i
     for _i in $(seq 1 20); do
         ss -lnt "sport = :$port" | grep -q ":$port" && {
@@ -309,17 +364,28 @@ main() {
     lock_node
     local command=${1:-}
     shift || true
+    if [[ "$command" == --b64 ]]; then
+        local decoded=() item
+        for item in "$@"; do
+            [[ "$item" =~ ^[A-Za-z0-9+/]*={0,2}$ ]] || die '非法 Base64 控制参数'
+            decoded+=("$(printf '%s' "$item" | base64 -d)")
+        done
+        ((${#decoded[@]} > 0)) || die '缺少编码命令'
+        command=${decoded[0]}
+        set -- "${decoded[@]:1}"
+    fi
     case "$command" in
         prepare) (($# == 4)) || die 'prepare 参数错误'; cmd_prepare "$@" ;;
         apply) (($# == 2)) || die 'apply 参数错误'; cmd_apply "$@" ;;
         health) (($# == 1)) || die 'health 参数错误'; cmd_health "$@" ;;
         restore|rollback) (($# == 1)) || die 'restore 参数错误'; cmd_restore_original "$@" ;;
         commit) (($# == 1)) || die 'commit 参数错误'; cmd_commit "$@" ;;
+        finalize) (($# == 1)) || die 'finalize 参数错误'; cmd_finalize "$@" ;;
         cleanup) (($# == 1)) || die 'cleanup 参数错误'; cmd_cleanup "$@" ;;
         discard) (($# == 1)) || die 'discard 参数错误'; cmd_discard "$@" ;;
         auto-rollback) (($# == 1)) || die 'auto-rollback 参数错误'; cmd_auto_rollback "$@" ;;
-        bench-server) (($# == 2)) || die 'bench-server 参数错误'; cmd_bench_server "$@" ;;
-        *) die '命令必须是 prepare/apply/health/restore/commit/cleanup/discard/auto-rollback/bench-server' ;;
+        bench-server) (($# == 3)) || die 'bench-server 参数错误'; cmd_bench_server "$@" ;;
+        *) die '命令必须是 prepare/apply/health/restore/commit/finalize/cleanup/discard/auto-rollback/bench-server' ;;
     esac
 }
 

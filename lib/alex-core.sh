@@ -113,6 +113,39 @@ alex_validate_managed_path() {
     [[ "$path" != *'/../'* && "$path" != *'/./'* && "$path" != */.. && "$path" != */. ]]
 }
 
+alex_validate_interface() {
+    [[ "$1" =~ ^[A-Za-z0-9_.:-]+$ ]]
+}
+
+alex_validate_tunnel_address() {
+    [[ "$1" =~ ^[0-9a-fA-F:.]+$ ]]
+}
+
+alex_b64_word() {
+    printf '%s' "$1" | base64 | tr -d '\n'
+}
+
+alex_parse_iperf_json() {
+    local input=$1
+    jq -er '
+        (.end.sum_received.bits_per_second // error("missing received throughput")) as $bps |
+        (.end.sum_sent.retransmits // 0) as $retrans |
+        if (($bps | type) != "number") or $bps <= 0 or (($retrans | type) != "number") or $retrans < 0
+        then error("invalid iperf3 metrics")
+        else [($bps / 1000000), $retrans] | @tsv
+        end
+    ' "$input"
+}
+
+alex_counter_delta() {
+    local before=$1 after=$2
+    if (( after >= before )); then
+        printf '%d\n' "$((after - before))"
+    else
+        printf '0\n'
+    fi
+}
+
 alex_transaction_id() {
     local random
     random=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')

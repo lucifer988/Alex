@@ -144,6 +144,56 @@ test_candidate_plan_has_baseline_and_bounded_values() {
     (( count >= 6 && count <= 16 ))
 }
 
+test_network_identifiers_reject_shell_metacharacters() {
+    # shellcheck disable=SC2016 # These are literal attack payloads.
+    alex_validate_interface ppp0 &&
+        alex_validate_tunnel_address 10.0.0.1 &&
+        alex_validate_tunnel_address fd00::1 &&
+        ! alex_validate_interface 'ppp0;id' &&
+        ! alex_validate_interface 'ppp0$(id)' &&
+        ! alex_validate_interface $'ppp0\nkey' &&
+        ! alex_validate_tunnel_address '10.0.0.1`id`' &&
+        ! alex_validate_tunnel_address '10.0.0.1>file'
+}
+
+test_base64_control_words_round_trip_without_shell_tokens() {
+    local value encoded decoded
+    # shellcheck disable=SC2016 # These are literal attack payloads.
+    for value in 'ppp0;id' '$(id)' $'line\nfeed' '`id`' '>file' 'plain value'; do
+        encoded=$(alex_b64_word "$value")
+        [[ "$encoded" =~ ^[A-Za-z0-9+/]*={0,2}$ ]]
+        decoded=$(printf '%s' "$encoded" | base64 -d)
+        assert_eq "$decoded" "$value"
+    done
+}
+
+test_iperf_parser_handles_forward_and_reverse_json() {
+    local forward reverse
+    forward=$(alex_parse_iperf_json "$ROOT/tests/fixtures/iperf-forward.json")
+    reverse=$(alex_parse_iperf_json "$ROOT/tests/fixtures/iperf-reverse.json")
+    [[ "$forward" == $'88260.39415272544\t0' ]]
+    [[ "$reverse" == $'101442.86086417078\t0' ]]
+}
+
+test_iperf_parser_rejects_missing_or_zero_throughput() {
+    local dir
+    dir=$(mktemp -d)
+    trap 'rm -rf "${dir:-}"' RETURN
+    printf '%s\n' '{"end":{"sum_received":{"bits_per_second":0},"sum_sent":{"retransmits":0}}}' >"$dir/zero.json"
+    printf '%s\n' '{"end":{"sum_sent":{"retransmits":0}}}' >"$dir/missing.json"
+    ! alex_parse_iperf_json "$dir/zero.json" >/dev/null 2>&1 &&
+        ! alex_parse_iperf_json "$dir/missing.json" >/dev/null 2>&1
+}
+
+test_counter_delta_does_not_mask_other_endpoint_drops() {
+    local local_delta remote_delta
+    local_delta=$(alex_counter_delta 100 0)
+    remote_delta=$(alex_counter_delta 0 10)
+    assert_eq "$local_delta" 0
+    assert_eq "$remote_delta" 10
+    assert_eq "$((local_delta + remote_delta))" 10
+}
+
 test_case 'score caps fixed 1000/60 access limits' test_score_caps_download_and_upload
 test_case 'score rejects unstable candidates' test_score_rejects_unstable_candidate
 test_case 'score penalizes retransmits and CPU saturation' test_score_penalizes_retransmits_and_cpu
@@ -157,6 +207,11 @@ test_case 'SSH target validation blocks injection' test_ssh_target_validation_bl
 test_case 'managed paths are absolute and shell safe' test_path_validation_allows_only_absolute_safe_paths
 test_case 'transaction IDs are unique and path safe' test_transaction_id_is_safe_and_unique
 test_case 'candidate plan is finite and bounded' test_candidate_plan_has_baseline_and_bounded_values
+test_case 'network identifiers reject shell metacharacters' test_network_identifiers_reject_shell_metacharacters
+test_case 'Base64 control words round trip safely' test_base64_control_words_round_trip_without_shell_tokens
+test_case 'iperf parser handles forward and reverse JSON' test_iperf_parser_handles_forward_and_reverse_json
+test_case 'iperf parser rejects missing or zero throughput' test_iperf_parser_rejects_missing_or_zero_throughput
+test_case 'counter reset does not mask other endpoint drops' test_counter_delta_does_not_mask_other_endpoint_drops
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

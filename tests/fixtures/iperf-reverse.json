@@ -1,0 +1,6 @@
+{
+  "end": {
+    "sum_sent": {"bits_per_second": 101435194313.61923, "retransmits": 0, "sender": false},
+    "sum_received": {"bits_per_second": 101442860864.17078, "sender": false}
+  }
+}
