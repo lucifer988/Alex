@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION=1.0.0
+VERSION=1.1.0
 PREFIX=${PREFIX:-/usr/local}
 ETC_DIR=${ALEX_ETC_DIR:-/etc/alex}
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -35,11 +35,13 @@ install_deps() {
 }
 
 install_deps
+[[ -r "$SCRIPT_DIR/lib/alex-core.sh" && -x "$SCRIPT_DIR/alex" && -x "$SCRIPT_DIR/alex-node" ]] ||
+    die '安装源文件不完整或执行权限不正确'
 install -d -m 0755 "$PREFIX/lib/alex/lib" "$PREFIX/sbin" "$ETC_DIR"
 install -m 0644 "$SCRIPT_DIR/lib/alex-core.sh" "$PREFIX/lib/alex/lib/alex-core.sh"
 install -m 0700 "$SCRIPT_DIR/alex-node" "$PREFIX/lib/alex/alex-node"
 install -m 0755 "$SCRIPT_DIR/alex" "$PREFIX/lib/alex/alex"
-ln -sfn "$PREFIX/lib/alex/alex" "$PREFIX/sbin/alex"
+ln -sfnT "$PREFIX/lib/alex/alex" "$PREFIX/sbin/alex"
 
 log "Alex $VERSION 已安装到 $PREFIX/sbin/alex"
 log "下一步：把已核对指纹的服务端主机密钥写入 $ETC_DIR/known_hosts"

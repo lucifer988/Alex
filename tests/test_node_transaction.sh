@@ -39,7 +39,11 @@ if [[ "$1 $2 $3 $4" == 'link set dev ppp0' && "$5" == txqueuelen ]]; then
   printf '%s\n' "$6" >"$ALEX_TEST_NET/ppp0/tx_queue_len"
 fi
 SH
-chmod +x "$BIN/systemctl" "$BIN/systemd-run" "$BIN/ip"
+cat >"$BIN/ps" <<'SH'
+#!/usr/bin/env bash
+printf '12.5\n'
+SH
+chmod +x "$BIN/systemctl" "$BIN/systemd-run" "$BIN/ip" "$BIN/ps"
 
 # Rewrite fixed kernel/systemd paths only in an isolated copy of the helper.
 HELPER="$TMP/alex-node"
@@ -65,6 +69,12 @@ CONFIG="$TMP/etc/openppp2/appsettings.json"
 [[ "$(stat -c '%a' "$TMP/state/transactions/$TXID")" == 700 ]]
 [[ -f "$TMP/state/active-transaction" ]]
 grep -q auto-rollback "$TMP/systemd-run.log"
+backup_sha=$(sha256sum "$TMP/state/transactions/$TXID/original.json" | awk '{print $1}')
+if "$HELPER" prepare "$TXID" "$CONFIG" test.service ppp0 >/dev/null 2>&1; then
+    echo 'duplicate prepare unexpectedly overwrote transaction state' >&2
+    exit 1
+fi
+[[ "$(sha256sum "$TMP/state/transactions/$TXID/original.json" | awk '{print $1}')" == "$backup_sha" ]]
 printf '%s\n' '{"concurrent":8,"key":{"protocol-key":"secret"},"mux":{"mode":"flow"}}' |
   "$HELPER" apply "$TXID" 5000 >/dev/null
 jq -e '.concurrent == 8 and .key["protocol-key"] == "secret"' "$CONFIG" >/dev/null
@@ -90,7 +100,13 @@ printf '%s\n' '{"concurrent":6,"key":{"protocol-key":"secret"},"mux":{"mode":"fl
   "$HELPER" apply "$TXID" 10000 >/dev/null
 "$HELPER" commit "$TXID" >/dev/null
 [[ -f "$TMP/etc/systemd/system/test.service.d/90-alex-tun-queue.conf" ]]
+[[ "$(stat -c '%a' "$TMP/etc/systemd/system/test.service.d/90-alex-tun-queue.conf")" == 644 ]]
 grep -q 'txqueuelen 10000' "$TMP/etc/systemd/system/test.service.d/90-alex-tun-queue.conf"
+if "$HELPER" cleanup "$TXID" >/dev/null 2>&1; then
+    echo 'cleanup unexpectedly removed an unfinalized committed transaction' >&2
+    exit 1
+fi
+[[ -d "$TMP/state/transactions/$TXID" ]]
 "$HELPER" auto-rollback "$TXID" >/dev/null
 cmp -s "$CONFIG" "$TMP/original.json"
 [[ ! -e "$TMP/state/transactions/$TXID" ]]
@@ -106,6 +122,20 @@ printf '%s\n' '{"concurrent":8,"key":{"protocol-key":"secret"},"mux":{"mode":"ba
 jq -e '.concurrent == 8 and .mux.mode == "balance"' "$CONFIG" >/dev/null
 [[ ! -e "$TMP/state/transactions/$TXID" ]]
 cp "$TMP/original.json" "$CONFIG"
+rm -f "$TMP/etc/systemd/system/test.service.d/90-alex-tun-queue.conf"
+
+TXID=20260720T120004Z-7766554433221100
+mkdir -p "$TMP/etc/systemd/system/test.service.d"
+printf '%s\n' '[Service]' 'Environment=KEEP=1' >"$TMP/etc/systemd/system/test.service.d/90-alex-tun-queue.conf"
+chmod 0640 "$TMP/etc/systemd/system/test.service.d/90-alex-tun-queue.conf"
+cp "$TMP/etc/systemd/system/test.service.d/90-alex-tun-queue.conf" "$TMP/original.dropin"
+"$HELPER" prepare "$TXID" "$CONFIG" test.service ppp0 >/dev/null
+printf '%s\n' '{"concurrent":6,"key":{"protocol-key":"secret"},"mux":{"mode":"flow"}}' |
+  "$HELPER" apply "$TXID" 5000 >/dev/null
+"$HELPER" restore "$TXID" >/dev/null
+cmp -s "$TMP/etc/systemd/system/test.service.d/90-alex-tun-queue.conf" "$TMP/original.dropin"
+[[ "$(stat -c '%a' "$TMP/etc/systemd/system/test.service.d/90-alex-tun-queue.conf")" == 640 ]]
+"$HELPER" cleanup "$TXID" >/dev/null
 rm -f "$TMP/etc/systemd/system/test.service.d/90-alex-tun-queue.conf"
 
 TXID=20260720T120004Z-aabbccddeeff0011

@@ -46,6 +46,13 @@ test_score_penalizes_retransmits_and_cpu() {
     (( clean > dirty ))
 }
 
+test_minimum_improvement_is_at_least_two_percent() {
+    assert_eq "$(alex_minimum_improved_score 50000)" 51000
+    assert_eq "$(alex_minimum_improved_score 1)" 2
+    assert_eq "$(alex_minimum_improved_score 0)" 1
+    ! alex_minimum_improved_score invalid >/dev/null
+}
+
 test_apply_candidate_preserves_unknown_and_secrets() {
     local dir input output
     dir=$(mktemp -d)
@@ -64,6 +71,16 @@ JSON
     jq -e '.concurrent == 8 and .mux.mode == "flow" and .mux.turbo == true' "$output" >/dev/null
     jq -e '.mux.tx.queue.max == 8192 and .mux.flow.reorder.bytes == 2097152' "$output" >/dev/null
     jq -e '.key["protocol-key"] == "keep-me" and .key.extra == 7 and .custom.untouched == true' "$output" >/dev/null
+}
+
+test_apply_candidate_rejects_incompatible_object_shapes() {
+    local dir input output
+    dir=$(mktemp -d)
+    trap 'rm -rf "${dir:-}"' RETURN
+    input="$dir/input.json"
+    output="$dir/output.json"
+    printf '%s\n' '{"concurrent":4,"mux":"legacy-scalar"}' >"$input"
+    ! alex_apply_candidate "$input" "$output" 8 flow true 8192 8000 2097152 300 >/dev/null 2>&1
 }
 
 test_candidate_validation_rejects_unsafe_values() {
@@ -114,6 +131,13 @@ test_ssh_target_validation_blocks_option_and_shell_injection() {
         ! alex_validate_ssh_target 'root;id' 203.0.113.8 22 &&
         ! alex_validate_ssh_target root 'host;id' 22 &&
         ! alex_validate_ssh_target root 203.0.113.8 70000
+}
+
+test_service_validation_blocks_systemctl_option_injection() {
+    alex_validate_service openppp2-client.service &&
+        alex_validate_service 'openppp2@edge.service' &&
+        ! alex_validate_service '--no-pager.service' &&
+        ! alex_validate_service 'bad;id.service'
 }
 
 test_path_validation_allows_only_absolute_safe_paths() {
@@ -181,8 +205,10 @@ test_iperf_parser_rejects_missing_or_zero_throughput() {
     trap 'rm -rf "${dir:-}"' RETURN
     printf '%s\n' '{"end":{"sum_received":{"bits_per_second":0},"sum_sent":{"retransmits":0}}}' >"$dir/zero.json"
     printf '%s\n' '{"end":{"sum_sent":{"retransmits":0}}}' >"$dir/missing.json"
+    printf '%s\n' '{"end":{"sum_received":{"bits_per_second":1000},"sum_sent":{"retransmits":0.5}}}' >"$dir/fractional.json"
     ! alex_parse_iperf_json "$dir/zero.json" >/dev/null 2>&1 &&
-        ! alex_parse_iperf_json "$dir/missing.json" >/dev/null 2>&1
+        ! alex_parse_iperf_json "$dir/missing.json" >/dev/null 2>&1 &&
+        ! alex_parse_iperf_json "$dir/fractional.json" >/dev/null 2>&1
 }
 
 test_counter_delta_does_not_mask_other_endpoint_drops() {
@@ -194,16 +220,65 @@ test_counter_delta_does_not_mask_other_endpoint_drops() {
     assert_eq "$((local_delta + remote_delta))" 10
 }
 
+test_counter_reset_is_reported_as_instability() {
+    alex_counter_reset 100 0 &&
+        ! alex_counter_reset 10 10 &&
+        ! alex_counter_reset 10 11
+}
+
+test_benchmark_rejects_pid_change_during_sampling() (
+    export ALEX_LIB="$ROOT/lib/alex-core.sh"
+    export ALEX_NODE_HELPER=/bin/true
+    # shellcheck source=../alex
+    source "$ROOT/alex"
+    local dir health_calls result
+    dir=$(mktemp -d)
+    trap 'rm -rf "$dir"' EXIT
+    printf '0\n' >"$dir/health-calls"
+    REPEATS=3
+    DOWNLOAD_CAP=1000
+    UPLOAD_CAP=60
+    # shellcheck disable=SC2317,SC2329 # benchmark invokes this test double dynamically.
+    health_pair() {
+        health_calls=$(cat "$dir/health-calls")
+        health_calls=$((health_calls + 1))
+        printf '%s\n' "$health_calls" >"$dir/health-calls"
+        if (( health_calls == 1 )); then
+            jq -n '{cpu_percent:20,local_drops:0,remote_drops:0,local_restarts:0,remote_restarts:0,local_pid:100,remote_pid:200}'
+        else
+            jq -n '{cpu_percent:20,local_drops:0,remote_drops:0,local_restarts:0,remote_restarts:0,local_pid:101,remote_pid:200}'
+        fi
+    }
+    # shellcheck disable=SC2317,SC2329 # benchmark invokes this test double dynamically.
+    iperf_sample() { printf '900 0\n'; }
+    result=$(benchmark)
+    jq -e '.unstable == true and .score == -1' <<<"$result" >/dev/null
+)
+
+test_missing_option_value_has_clear_failure() {
+    local output next_option
+    if output=$("$ROOT/alex" optimize --ssh-host 2>&1); then
+        return 1
+    fi
+    if next_option=$("$ROOT/alex" optimize --ssh-host --yes 2>&1); then
+        return 1
+    fi
+    [[ "$output" == *'参数 --ssh-host 缺少值'* && "$next_option" == *'参数 --ssh-host 缺少值'* ]]
+}
+
 test_case 'score caps fixed 1000/60 access limits' test_score_caps_download_and_upload
 test_case 'score rejects unstable candidates' test_score_rejects_unstable_candidate
 test_case 'score penalizes retransmits and CPU saturation' test_score_penalizes_retransmits_and_cpu
+test_case 'minimum persisted improvement is at least two percent' test_minimum_improvement_is_at_least_two_percent
 test_case 'candidate edit preserves keys and unknown fields' test_apply_candidate_preserves_unknown_and_secrets
+test_case 'candidate edit rejects incompatible object shapes' test_apply_candidate_rejects_incompatible_object_shapes
 test_case 'candidate validation rejects unsafe values' test_candidate_validation_rejects_unsafe_values
 test_case 'candidate validation accepts supported values' test_candidate_validation_accepts_supported_values
 test_case 'atomic install replaces target and clears stage' test_atomic_install_replaces_target_and_cleans_stage
 test_case 'cleanup removes only registered paths' test_cleanup_removes_only_registered_paths
 test_case 'median selects middle valid throughput sample' test_median_uses_middle_valid_sample
 test_case 'SSH target validation blocks injection' test_ssh_target_validation_blocks_option_and_shell_injection
+test_case 'systemd service validation blocks option injection' test_service_validation_blocks_systemctl_option_injection
 test_case 'managed paths are absolute and shell safe' test_path_validation_allows_only_absolute_safe_paths
 test_case 'transaction IDs are unique and path safe' test_transaction_id_is_safe_and_unique
 test_case 'candidate plan is finite and bounded' test_candidate_plan_has_baseline_and_bounded_values
@@ -212,6 +287,9 @@ test_case 'Base64 control words round trip safely' test_base64_control_words_rou
 test_case 'iperf parser handles forward and reverse JSON' test_iperf_parser_handles_forward_and_reverse_json
 test_case 'iperf parser rejects missing or zero throughput' test_iperf_parser_rejects_missing_or_zero_throughput
 test_case 'counter reset does not mask other endpoint drops' test_counter_delta_does_not_mask_other_endpoint_drops
+test_case 'counter reset is marked unstable' test_counter_reset_is_reported_as_instability
+test_case 'benchmark rejects service PID changes' test_benchmark_rejects_pid_change_during_sampling
+test_case 'missing option values fail clearly' test_missing_option_value_has_clear_failure
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

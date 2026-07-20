@@ -29,6 +29,14 @@ alex_score() {
     }'
 }
 
+alex_minimum_improved_score() {
+    local baseline=$1 delta
+    [[ "$baseline" =~ ^[0-9]+$ ]] || return 1
+    delta=$(((baseline + 49) / 50))
+    (( delta > 0 )) || delta=1
+    printf '%d\n' "$((baseline + delta))"
+}
+
 alex_validate_candidate() {
     local concurrent=$1 mode=$2 turbo=$3 queue_max=$4 queue_stall=$5
     local reorder_bytes=$6 reorder_timeout=$7
@@ -57,15 +65,15 @@ alex_apply_candidate() {
         --argjson reorder_bytes "$reorder_bytes" \
         --argjson reorder_timeout "$reorder_timeout" '
         .concurrent = $concurrent |
-        .mux = (.mux // {}) |
+        .mux = (if .mux == null then {} elif (.mux | type) == "object" then .mux else error("mux must be an object") end) |
         .mux.mode = $mode |
         .mux.turbo = $turbo |
-        .mux.tx = (.mux.tx // {}) |
-        .mux.tx.queue = (.mux.tx.queue // {}) |
+        .mux.tx = (if .mux.tx == null then {} elif (.mux.tx | type) == "object" then .mux.tx else error("mux.tx must be an object") end) |
+        .mux.tx.queue = (if .mux.tx.queue == null then {} elif (.mux.tx.queue | type) == "object" then .mux.tx.queue else error("mux.tx.queue must be an object") end) |
         .mux.tx.queue.max = $queue_max |
         .mux.tx.queue.stall = $queue_stall |
-        .mux.flow = (.mux.flow // {}) |
-        .mux.flow.reorder = (.mux.flow.reorder // {}) |
+        .mux.flow = (if .mux.flow == null then {} elif (.mux.flow | type) == "object" then .mux.flow else error("mux.flow must be an object") end) |
+        .mux.flow.reorder = (if .mux.flow.reorder == null then {} elif (.mux.flow.reorder | type) == "object" then .mux.flow.reorder else error("mux.flow.reorder must be an object") end) |
         .mux.flow.reorder.bytes = $reorder_bytes |
         .mux.flow.reorder.timeout = $reorder_timeout
     ' "$input" >"$output"
@@ -107,6 +115,10 @@ alex_validate_ssh_target() {
     [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || return 1
 }
 
+alex_validate_service() {
+    [[ "$1" =~ ^[A-Za-z0-9_.@-]+\.service$ && "$1" != -* ]]
+}
+
 alex_validate_managed_path() {
     local path=$1
     [[ "$path" =~ ^/(opt|etc|usr/local/etc)/[A-Za-z0-9._/+:-]+$ ]] || return 1
@@ -130,7 +142,8 @@ alex_parse_iperf_json() {
     jq -er '
         (.end.sum_received.bits_per_second // error("missing received throughput")) as $bps |
         (.end.sum_sent.retransmits // 0) as $retrans |
-        if (($bps | type) != "number") or $bps <= 0 or (($retrans | type) != "number") or $retrans < 0
+        if (($bps | type) != "number") or $bps <= 0 or (($retrans | type) != "number") or
+            $retrans < 0 or (($retrans | floor) != $retrans)
         then error("invalid iperf3 metrics")
         else [($bps / 1000000), $retrans] | @tsv
         end
@@ -146,6 +159,12 @@ alex_counter_delta() {
     fi
 }
 
+alex_counter_reset() {
+    local before=$1 after=$2
+    [[ "$before" =~ ^[0-9]+$ && "$after" =~ ^[0-9]+$ ]] || return 1
+    (( after < before ))
+}
+
 alex_transaction_id() {
     local random
     random=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
@@ -157,16 +176,19 @@ alex_candidate_plan() {
     local base_queue_stall=$5 base_reorder_bytes=$6 base_reorder_timeout=$7
     local concurrent
 
-    # Baseline first, then one-dimensional probes, then two conservative combined candidates.
-    printf '%s %s %s %s %s %s %s 1000\n' "$base_concurrent" "$base_mode" \
-        "$base_turbo" "$base_queue_max" "$base_queue_stall" "$base_reorder_bytes" "$base_reorder_timeout"
-    for concurrent in 2 4 6 8; do
-        [[ "$concurrent" == "$base_concurrent" ]] && continue
-        printf '%s %s %s %s %s %s %s 5000\n' "$concurrent" "$base_mode" \
+    # Baseline first, then one-dimensional probes, then conservative combined candidates.
+    # De-duplicate plans when the existing configuration already matches a probe.
+    {
+        printf '%s %s %s %s %s %s %s 1000\n' "$base_concurrent" "$base_mode" \
             "$base_turbo" "$base_queue_max" "$base_queue_stall" "$base_reorder_bytes" "$base_reorder_timeout"
-    done
-    printf '%s flow false 4096 8000 1048576 400 5000\n' "$base_concurrent"
-    printf '%s flow true 4096 8000 2097152 400 5000\n' "$base_concurrent"
-    printf '6 flow true 8192 8000 2097152 400 10000\n'
-    printf '8 balance false 8192 8000 2097152 400 10000\n'
+        for concurrent in 2 4 6 8; do
+            [[ "$concurrent" == "$base_concurrent" ]] && continue
+            printf '%s %s %s %s %s %s %s 5000\n' "$concurrent" "$base_mode" \
+                "$base_turbo" "$base_queue_max" "$base_queue_stall" "$base_reorder_bytes" "$base_reorder_timeout"
+        done
+        printf '%s flow false 4096 8000 1048576 400 5000\n' "$base_concurrent"
+        printf '%s flow true 4096 8000 2097152 400 5000\n' "$base_concurrent"
+        printf '6 flow true 8192 8000 2097152 400 10000\n'
+        printf '8 balance false 8192 8000 2097152 400 10000\n'
+    } | awk '!seen[$0]++'
 }

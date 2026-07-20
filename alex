@@ -9,6 +9,7 @@ NODE_HELPER=${ALEX_NODE_HELPER:-$SELF_DIR/alex-node}
 # shellcheck source=lib/alex-core.sh
 source "$LIB"
 
+VERSION=1.1.0
 DOWNLOAD_CAP=1000
 UPLOAD_CAP=60
 SSH_USER=root
@@ -28,6 +29,7 @@ TIME=15
 REPEATS=3
 YES=0
 DRY_RUN=0
+INSTALL_REMOTE_DEPS=0
 TXID=
 WORKDIR=
 BEST_LOCAL=
@@ -58,14 +60,26 @@ Alex - OpenPPP2 双端自动调优
   --remote-config PATH            服务端配置
   --local-service UNIT            客户端 systemd 服务
   --remote-service UNIT           服务端 systemd 服务
+  --local-tun IFACE               客户端 TUN 接口，默认 ppp0
+  --remote-tun IFACE              服务端 TUN 接口，默认 ppp0
   --tun-server IP                 隧道内服务端地址，默认 10.0.0.1
+  --bench-port PORT               iperf3 测速端口，默认 5201
   --download-cap MBPS             默认且最大评分目标 1000
   --upload-cap MBPS               默认且最大评分目标 60
   --time SEC                      单次测速时长，默认 15
   --repeats N                     每个方向次数，默认 3
+  --install-remote-deps           明确允许在远端安装缺失依赖
   --yes                           非交互确认
   --dry-run                       只检测并列出候选，不修改
+  --version                       显示版本
 EOF
+}
+
+need_value() {
+    local option=$1
+    if (($# < 2)) || [[ "$2" == -* ]]; then
+        die "参数 $option 缺少值"
+    fi
 }
 
 parse_args() {
@@ -73,26 +87,28 @@ parse_args() {
     shift || true
     while (($#)); do
         case "$1" in
-            --ssh-host) SSH_HOST=$2; shift 2 ;;
-            --ssh-user) SSH_USER=$2; shift 2 ;;
-            --ssh-port) SSH_PORT=$2; shift 2 ;;
-            --ssh-key) SSH_KEY=$2; shift 2 ;;
-            --known-hosts) SSH_KNOWN_HOSTS=$2; shift 2 ;;
-            --local-config) LOCAL_CONFIG=$2; shift 2 ;;
-            --remote-config) REMOTE_CONFIG=$2; shift 2 ;;
-            --local-service) LOCAL_SERVICE=$2; shift 2 ;;
-            --remote-service) REMOTE_SERVICE=$2; shift 2 ;;
-            --local-tun) LOCAL_TUN=$2; shift 2 ;;
-            --remote-tun) REMOTE_TUN=$2; shift 2 ;;
-            --tun-server) TUN_SERVER=$2; shift 2 ;;
-            --bench-port) BENCH_PORT=$2; shift 2 ;;
-            --download-cap) DOWNLOAD_CAP=$2; shift 2 ;;
-            --upload-cap) UPLOAD_CAP=$2; shift 2 ;;
-            --time) TIME=$2; shift 2 ;;
-            --repeats) REPEATS=$2; shift 2 ;;
+            --ssh-host) need_value "$@"; SSH_HOST=$2; shift 2 ;;
+            --ssh-user) need_value "$@"; SSH_USER=$2; shift 2 ;;
+            --ssh-port) need_value "$@"; SSH_PORT=$2; shift 2 ;;
+            --ssh-key) need_value "$@"; SSH_KEY=$2; shift 2 ;;
+            --known-hosts) need_value "$@"; SSH_KNOWN_HOSTS=$2; shift 2 ;;
+            --local-config) need_value "$@"; LOCAL_CONFIG=$2; shift 2 ;;
+            --remote-config) need_value "$@"; REMOTE_CONFIG=$2; shift 2 ;;
+            --local-service) need_value "$@"; LOCAL_SERVICE=$2; shift 2 ;;
+            --remote-service) need_value "$@"; REMOTE_SERVICE=$2; shift 2 ;;
+            --local-tun) need_value "$@"; LOCAL_TUN=$2; shift 2 ;;
+            --remote-tun) need_value "$@"; REMOTE_TUN=$2; shift 2 ;;
+            --tun-server) need_value "$@"; TUN_SERVER=$2; shift 2 ;;
+            --bench-port) need_value "$@"; BENCH_PORT=$2; shift 2 ;;
+            --download-cap) need_value "$@"; DOWNLOAD_CAP=$2; shift 2 ;;
+            --upload-cap) need_value "$@"; UPLOAD_CAP=$2; shift 2 ;;
+            --time) need_value "$@"; TIME=$2; shift 2 ;;
+            --repeats) need_value "$@"; REPEATS=$2; shift 2 ;;
+            --install-remote-deps) INSTALL_REMOTE_DEPS=1; shift ;;
             --yes) YES=1; shift ;;
             --dry-run) DRY_RUN=1; shift ;;
             -h|--help) usage; exit 0 ;;
+            --version) printf 'Alex %s\n' "$VERSION"; exit 0 ;;
             *) die "未知参数: $1" ;;
         esac
     done
@@ -104,8 +120,8 @@ validate() {
     alex_validate_ssh_target "$SSH_USER" "$SSH_HOST" "$SSH_PORT" || die 'SSH 目标参数非法'
     alex_validate_managed_path "$LOCAL_CONFIG" || die '本地配置路径非法'
     alex_validate_managed_path "$REMOTE_CONFIG" || die '远端配置路径非法'
-    [[ "$LOCAL_SERVICE" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || die '本地服务名非法'
-    [[ "$REMOTE_SERVICE" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || die '远端服务名非法'
+    alex_validate_service "$LOCAL_SERVICE" || die '本地服务名非法'
+    alex_validate_service "$REMOTE_SERVICE" || die '远端服务名非法'
     alex_validate_interface "$LOCAL_TUN" || die '本地 TUN 接口名非法'
     alex_validate_interface "$REMOTE_TUN" || die '远端 TUN 接口名非法'
     alex_validate_tunnel_address "$TUN_SERVER" || die '隧道服务端地址非法'
@@ -114,22 +130,27 @@ validate() {
     if ! [[ "$TIME" =~ ^[0-9]+$ ]] || (( TIME < 5 || TIME > 120 )); then die '测速时间必须为 5-120 秒'; fi
     if ! [[ "$REPEATS" =~ ^[0-9]+$ ]] || (( REPEATS < 3 || REPEATS > 7 )); then die '重复次数必须为 3-7'; fi
     if ! [[ "$BENCH_PORT" =~ ^[0-9]+$ ]] || (( BENCH_PORT < 5201 || BENCH_PORT > 5299 )); then die '测速端口必须为 5201-5299'; fi
-    [[ -f "$NODE_HELPER" && -f "$LIB" ]] || die '安装不完整：缺少 helper/core'
+    [[ -x "$NODE_HELPER" && -r "$LIB" ]] || die '安装不完整：helper 不可执行或 core 不可读'
     [[ -n "$SSH_KEY" && -f "$SSH_KEY" ]] || die '必须提供存在的 --ssh-key'
     [[ -f "$SSH_KNOWN_HOSTS" ]] || die "known_hosts 不存在: $SSH_KNOWN_HOSTS；请先用 ssh-keyscan 后带外核对指纹"
-    command -v iperf3 >/dev/null || die '本机缺少 iperf3'
-    command -v jq >/dev/null || die '本机缺少 jq'
+    local tool
+    for tool in awk base64 cat date dirname flock grep install ip iperf3 jq mktemp mv od ps \
+        readlink rm seq sha256sum sleep sort ss ssh stat sync systemctl systemd-run tr; do
+        command -v "$tool" >/dev/null 2>&1 || die "本机缺少依赖: $tool"
+    done
 }
 
 ssh_args() {
     SSH_ARGS=(-p "$SSH_PORT" -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes
         -o "UserKnownHostsFile=$SSH_KNOWN_HOSTS" -o IdentitiesOnly=yes -o ConnectTimeout=10
         -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ForwardAgent=no
-        -o ClearAllForwardings=yes -o RequestTTY=no)
+        -o ClearAllForwardings=yes -o RequestTTY=no -o PasswordAuthentication=no
+        -o KbdInteractiveAuthentication=no -o GlobalKnownHostsFile=/dev/null
+        -o UpdateHostKeys=no)
 }
 
 remote_exec() {
-    local command="sudo -- ${REMOTE_HELPER} --b64" arg encoded
+    local command="sudo -n -- ${REMOTE_HELPER} --b64" arg encoded
     for arg in "$@"; do
         encoded=$(alex_b64_word "$arg")
         command+=" ${encoded}"
@@ -139,23 +160,28 @@ remote_exec() {
 
 upload_helper() {
     REMOTE_HELPER="/usr/local/libexec/alex-node-${TXID}"
-    ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo install -d -m 0755 /usr/local/libexec
-    ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo install -m 0700 /dev/stdin "$REMOTE_HELPER" <"$NODE_HELPER"
+    ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo -n -- install -d -m 0755 /usr/local/libexec
+    ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo -n -- install -m 0700 /dev/stdin "$REMOTE_HELPER" <"$NODE_HELPER"
     local local_sha remote_sha
     local_sha=$(sha256sum "$NODE_HELPER" | awk '{print $1}')
-    remote_sha=$(ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo -- sha256sum -- "$REMOTE_HELPER" | awk '{print $1}')
+    remote_sha=$(ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo -n -- sha256sum -- "$REMOTE_HELPER" | awk '{print $1}')
     [[ "$local_sha" == "$remote_sha" ]] || die '远端 helper 校验和不匹配'
 }
 
 ensure_remote_dependencies() {
-    log '检查远端依赖；如缺失将通过系统包管理器自动安装'
-    ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo -- sh -s <<'SH'
+    log '检查远端运行依赖'
+    ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo -n -- env "ALEX_INSTALL_DEPS=$INSTALL_REMOTE_DEPS" sh -s <<'SH'
 set -eu
-missing=0
-for tool in awk base64 bash cat flock grep ip iperf3 install jq ps seq sha256sum sleep ss stat sync systemctl systemd-run tr; do
-    command -v "$tool" >/dev/null 2>&1 || missing=1
+missing=
+for tool in awk base64 bash cat dirname flock grep ip iperf3 install jq mv ps rm seq sha256sum sleep ss stat sync systemctl systemd-run tr; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
 done
-[ "$missing" -eq 0 ] && exit 0
+[ -z "$missing" ] && exit 0
+if [ "${ALEX_INSTALL_DEPS:-0}" != 1 ]; then
+    echo "Alex: 远端缺少依赖:$missing" >&2
+    echo 'Alex: 请手工安装，或明确添加 --install-remote-deps 后重试' >&2
+    exit 1
+fi
 if command -v apt-get >/dev/null 2>&1; then
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y bash jq iperf3 util-linux iproute2 coreutils procps grep mawk systemd
@@ -167,7 +193,7 @@ else
     echo 'Alex: 远端缺少依赖，且不是受支持的 systemd 发行版' >&2
     exit 1
 fi
-for tool in awk base64 bash cat flock grep ip iperf3 install jq ps seq sha256sum sleep ss stat sync systemctl systemd-run tr; do
+for tool in awk base64 bash cat dirname flock grep ip iperf3 install jq mv ps rm seq sha256sum sleep ss stat sync systemctl systemd-run tr; do
     command -v "$tool" >/dev/null 2>&1 || { echo "Alex: 远端安装后仍缺少 $tool" >&2; exit 1; }
 done
 SH
@@ -175,7 +201,7 @@ SH
 
 remove_remote_helper() {
     [[ -n "$REMOTE_HELPER" ]] || return 0
-    ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo rm -f -- "$REMOTE_HELPER" 2>/dev/null || true
+    ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo -n -- rm -f -- "$REMOTE_HELPER" 2>/dev/null || true
 }
 
 cleanup_committed_pair() {
@@ -215,6 +241,13 @@ cleanup() {
     exit "$rc"
 }
 
+on_signal() {
+    local code=$1 name=$2
+    trap - INT TERM HUP
+    log "收到 $name，中止并进入事务清理"
+    exit "$code"
+}
+
 prepare_transaction() {
     TXID=${TXID:-$(alex_transaction_id)}
     WORKDIR=$(mktemp -d "/run/alex-coordinator.${TXID}.XXXXXX")
@@ -226,7 +259,7 @@ prepare_transaction() {
     REMOTE_PREPARED=1
     remote_exec prepare "$TXID" "$REMOTE_CONFIG" "$REMOTE_SERVICE" "$REMOTE_TUN" >/dev/null
     install -m 0600 "$LOCAL_CONFIG" "$WORKDIR/base-local.json"
-    ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo cat -- "$REMOTE_CONFIG" >"$WORKDIR/base-remote.json"
+    ssh "${SSH_ARGS[@]}" "${SSH_USER}@${SSH_HOST}" sudo -n -- cat -- "$REMOTE_CONFIG" >"$WORKDIR/base-remote.json"
     jq -e 'type == "object"' "$WORKDIR/base-remote.json" >/dev/null
 }
 
@@ -250,10 +283,15 @@ health_pair() {
     local local_health remote_health
     local_health=$("$NODE_HELPER" health "$TXID")
     remote_health=$(remote_exec health "$TXID")
-    jq -e '.ok and .restarts >= 0' <<<"$local_health" >/dev/null
-    jq -e '.ok and .restarts >= 0' <<<"$remote_health" >/dev/null
+    jq -e '.ok and ([.pid,.restarts,.cpu_percent,.tun_drops] | all(.[]; type == "number" and . >= 0)) and .pid > 0' \
+        <<<"$local_health" >/dev/null
+    jq -e '.ok and ([.pid,.restarts,.cpu_percent,.tun_drops] | all(.[]; type == "number" and . >= 0)) and .pid > 0' \
+        <<<"$remote_health" >/dev/null
     jq -n --argjson l "$local_health" --argjson r "$remote_health" \
-        '{cpu_percent:([$l.cpu_percent,$r.cpu_percent]|max),local_drops:$l.tun_drops,remote_drops:$r.tun_drops}'
+        '{cpu_percent:([$l.cpu_percent,$r.cpu_percent]|max),
+          local_drops:$l.tun_drops,remote_drops:$r.tun_drops,
+          local_restarts:$l.restarts,remote_restarts:$r.restarts,
+          local_pid:$l.pid,remote_pid:$r.pid}'
 }
 
 iperf_sample() {
@@ -267,7 +305,8 @@ iperf_sample() {
 }
 
 benchmark() {
-    local downloads=() uploads=() retrans=0 value r i health_before health_after cpu local_delta remote_delta drops score
+    local downloads=() uploads=() retrans=0 value r i health_before health_after
+    local cpu local_delta remote_delta drops restart_delta unstable=0 score
     health_before=$(health_pair) || return 1
     for ((i=0; i<REPEATS; i++)); do
         read -r value r < <(iperf_sample 1) || return 1
@@ -280,13 +319,26 @@ benchmark() {
     local_delta=$(alex_counter_delta "$(jq -r '.local_drops' <<<"$health_before")" "$(jq -r '.local_drops' <<<"$health_after")")
     remote_delta=$(alex_counter_delta "$(jq -r '.remote_drops' <<<"$health_before")" "$(jq -r '.remote_drops' <<<"$health_after")")
     drops=$((local_delta + remote_delta))
+    restart_delta=$(alex_counter_delta "$(jq -r '.local_restarts' <<<"$health_before")" "$(jq -r '.local_restarts' <<<"$health_after")")
+    restart_delta=$((restart_delta + $(alex_counter_delta "$(jq -r '.remote_restarts' <<<"$health_before")" "$(jq -r '.remote_restarts' <<<"$health_after")")))
+    [[ "$(jq -r '.local_pid' <<<"$health_before")" == "$(jq -r '.local_pid' <<<"$health_after")" ]] || unstable=1
+    [[ "$(jq -r '.remote_pid' <<<"$health_before")" == "$(jq -r '.remote_pid' <<<"$health_after")" ]] || unstable=1
+    (( restart_delta == 0 )) || unstable=1
+    if alex_counter_reset "$(jq -r '.local_drops' <<<"$health_before")" "$(jq -r '.local_drops' <<<"$health_after")" ||
+        alex_counter_reset "$(jq -r '.remote_drops' <<<"$health_before")" "$(jq -r '.remote_drops' <<<"$health_after")" ||
+        alex_counter_reset "$(jq -r '.local_restarts' <<<"$health_before")" "$(jq -r '.local_restarts' <<<"$health_after")" ||
+        alex_counter_reset "$(jq -r '.remote_restarts' <<<"$health_before")" "$(jq -r '.remote_restarts' <<<"$health_after")"; then
+        unstable=1
+    fi
     local download upload
     download=$(alex_median "${downloads[@]}")
     upload=$(alex_median "${uploads[@]}")
-    score=$(alex_score "$download" "$upload" "$retrans" 0 "$cpu" "$drops" "$DOWNLOAD_CAP" "$UPLOAD_CAP")
+    score=$(alex_score "$download" "$upload" "$retrans" "$unstable" "$cpu" "$drops" "$DOWNLOAD_CAP" "$UPLOAD_CAP")
     jq -n --argjson download "$download" --argjson upload "$upload" --argjson retrans "$retrans" \
-        --argjson cpu "$cpu" --argjson drops "$drops" --argjson score "$score" \
-        '{download_mbps:$download,upload_mbps:$upload,retransmits:$retrans,cpu_percent:$cpu,tun_drops:$drops,score:$score}'
+        --argjson cpu "$cpu" --argjson drops "$drops" --argjson restarts "$restart_delta" \
+        --argjson unstable "$unstable" --argjson score "$score" \
+        '{download_mbps:$download,upload_mbps:$upload,retransmits:$retrans,cpu_percent:$cpu,
+          tun_drops:$drops,restarts:$restarts,unstable:($unstable != 0),score:$score}'
 }
 
 restore_pair() {
@@ -301,6 +353,15 @@ optimize() {
     local values concurrent mode turbo queue_max queue_stall reorder_bytes reorder_timeout qlen
     values=$(config_values "$WORKDIR/base-local.json")
     read -r concurrent mode turbo queue_max queue_stall reorder_bytes reorder_timeout <<<"$values"
+    alex_validate_candidate "$concurrent" "$mode" "$turbo" "$queue_max" "$queue_stall" \
+        "$reorder_bytes" "$reorder_timeout" || die '原配置中的调优字段类型或取值超出支持范围'
+    local base probe
+    for base in "$WORKDIR/base-local.json" "$WORKDIR/base-remote.json"; do
+        probe=$(mktemp "$WORKDIR/config-probe.XXXXXX.json")
+        alex_apply_candidate "$base" "$probe" "$concurrent" "$mode" "$turbo" "$queue_max" \
+            "$queue_stall" "$reorder_bytes" "$reorder_timeout" 2>/dev/null ||
+            die '原配置的 mux/tx/queue/flow/reorder 结构不是对象，拒绝修改'
+    done
     if (( DRY_RUN )); then
         alex_candidate_plan "$concurrent" "$mode" "$turbo" "$queue_max" "$queue_stall" "$reorder_bytes" "$reorder_timeout"
         "$NODE_HELPER" discard "$TXID" >/dev/null
@@ -316,11 +377,13 @@ optimize() {
         [[ "$answer" == YES ]] || die '用户取消'
     fi
 
-    local baseline_result baseline_score best_score index=0 result candidate_local candidate_remote
+    local baseline_result baseline_score minimum_score best_score index=0 result candidate_local candidate_remote
     log '测试当前原始配置基线'
     baseline_result=$(benchmark) || die '原始基线没有通过稳定性验证，未开始扫描'
     baseline_score=$(jq -r '.score' <<<"$baseline_result")
-    best_score=$((baseline_score + ((baseline_score + 49) / 50)))
+    (( baseline_score >= 0 )) || die '原始基线发生服务重启、计数器重置或新增丢包，未开始扫描'
+    minimum_score=$(alex_minimum_improved_score "$baseline_score")
+    best_score=$minimum_score
     while read -r concurrent mode turbo queue_max queue_stall reorder_bytes reorder_timeout qlen; do
         index=$((index + 1))
         candidate_local="$WORKDIR/local-$index.json"
@@ -345,7 +408,7 @@ optimize() {
         local score
         score=$(jq -r '.score' <<<"$result")
         printf '%s\n' "$result" >"$WORKDIR/result-$index.json"
-        if (( score > best_score )); then
+        if (( score >= best_score )); then
             best_score=$score
             BEST_LOCAL="$WORKDIR/best-local.json"
             BEST_REMOTE="$WORKDIR/best-remote.json"
@@ -353,6 +416,14 @@ optimize() {
             install -m 0600 "$candidate_remote" "$BEST_REMOTE"
             printf '%s\n' "$qlen" >"$WORKDIR/best.qlen"
             printf '%s\n' "$result" >"$WORKDIR/best-result.json"
+            jq -n --argjson concurrent "$concurrent" --arg mode "$mode" --argjson turbo "$turbo" \
+                --argjson queue_max "$queue_max" --argjson queue_stall "$queue_stall" \
+                --argjson reorder_bytes "$reorder_bytes" --argjson reorder_timeout "$reorder_timeout" \
+                --argjson txqueuelen "$qlen" \
+                '{concurrent:$concurrent,mux:{mode:$mode,turbo:$turbo,
+                  tx:{queue:{max:$queue_max,stall:$queue_stall}},
+                  flow:{reorder:{bytes:$reorder_bytes,timeout:$reorder_timeout}}},
+                  tun_txqueuelen:$txqueuelen}' >"$WORKDIR/best-params.json"
         fi
         restore_pair
     done < <(alex_candidate_plan "$concurrent" "$mode" "$turbo" "$queue_max" "$queue_stall" "$reorder_bytes" "$reorder_timeout")
@@ -361,21 +432,27 @@ optimize() {
         COMMITTED=1
         "$NODE_HELPER" cleanup "$TXID" >/dev/null
         remote_exec cleanup "$TXID" >/dev/null
-        jq -n --arg transaction "$TXID" --argjson result "$baseline_result" \
-            '{ok:true,transaction:$transaction,persisted:false,message:"没有候选超过原始基线，保持原配置",result:$result}'
+        jq -n --arg transaction "$TXID" --argjson minimum_score "$minimum_score" --argjson result "$baseline_result" \
+            '{ok:true,transaction:$transaction,persisted:false,minimum_score:$minimum_score,
+              message:"没有候选达到至少 2% 的改进门槛，保持原配置",result:$result}'
         return
     fi
     qlen=$(cat "$WORKDIR/best.qlen")
     apply_pair "$BEST_LOCAL" "$BEST_REMOTE" "$qlen" || die '重新应用最优候选失败'
     result=$(benchmark) || die '最优候选提交前复验失败'
+    (( $(jq -r '.score' <<<"$result") >= minimum_score )) || die '最优候选提交前复验未达到改进门槛'
     "$NODE_HELPER" commit "$TXID" >/dev/null
     remote_exec commit "$TXID" >/dev/null
     result=$(benchmark) || die '持久化重启后的最终复验失败'
+    (( $(jq -r '.score' <<<"$result") >= minimum_score )) || die '持久化后的最终复验未达到改进门槛'
     finalize_pair || die '双端 finalize 失败，将执行保护性回退'
     COMMITTED=1
     cleanup_committed_pair
-    jq -n --arg transaction "$TXID" --argjson result "$result" \
-        '{ok:true,transaction:$transaction,persisted:true,result:$result}'
+    jq -n --arg transaction "$TXID" --argjson minimum_score "$minimum_score" \
+        --argjson baseline "$baseline_result" --argjson tuning "$(cat "$WORKDIR/best-params.json")" \
+        --argjson result "$result" \
+        '{ok:true,transaction:$transaction,persisted:true,minimum_score:$minimum_score,
+          baseline:$baseline,tuning:$tuning,result:$result}'
 }
 
 detect() {
@@ -391,18 +468,23 @@ detect() {
 }
 
 main() {
-    if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then
-        usage
-        exit 0
-    fi
+    case "${1:-}" in
+        -h|--help) usage; exit 0 ;;
+        --version) printf 'Alex %s\n' "$VERSION"; exit 0 ;;
+    esac
     parse_args "$@"
     validate
     ssh_args
-    trap cleanup EXIT INT TERM HUP
+    trap cleanup EXIT
+    trap 'on_signal 130 INT' INT
+    trap 'on_signal 143 TERM' TERM
+    trap 'on_signal 129 HUP' HUP
     case "$COMMAND" in
         detect) detect ;;
         optimize) optimize ;;
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
