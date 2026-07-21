@@ -104,6 +104,8 @@ sudo alex optimize \
 服务端服务   openppp2-server.service
 客户端 TUN   ppp0
 服务端 TUN   ppp0
+远端模式     server
+测速模式     managed
 隧道服务端   10.0.0.1
 测速端口     5201
 测试时长     每方向 15 秒 x 3 次
@@ -121,6 +123,7 @@ sudo alex optimize \
   --remote-config /etc/openppp2/server.json \
   --local-service ppp-client.service \
   --remote-service ppp-server.service \
+  --remote-mode server \
   --tun-server 10.0.0.1 \
   --yes
 ```
