@@ -80,6 +80,7 @@ sudo alex optimize \
   --ssh-host SERVER_IP \
   --ssh-user root \
   --ssh-key /root/.ssh/id_ed25519 \
+  --remote-mode server \
   --yes
 ```
 
@@ -89,6 +90,7 @@ sudo alex optimize \
 sudo alex optimize \
   --ssh-host SERVER_IP \
   --ssh-key /root/.ssh/id_ed25519 \
+  --remote-mode server \
   --install-remote-deps \
   --yes
 ```

@@ -23,7 +23,7 @@ LOCAL_SERVICE=openppp2-client.service
 REMOTE_SERVICE=openppp2-server.service
 LOCAL_TUN=ppp0
 REMOTE_TUN=ppp0
-REMOTE_MODE=client
+REMOTE_MODE=server
 BENCH_MODE=managed
 TUN_SERVER=10.0.0.1
 BENCH_TARGET=
@@ -65,7 +65,7 @@ Alex - OpenPPP2 双端自动调优
   --remote-service UNIT           服务端 systemd 服务
   --local-tun IFACE               客户端 TUN 接口，默认 ppp0
   --remote-tun IFACE              服务端 TUN 接口，默认 ppp0
-  --remote-mode MODE              远端模式：client 或 server，默认 client
+  --remote-mode MODE              远端模式：client 或 server，默认 server
   --bench-mode MODE               测速模式：managed 或 existing，默认 managed
   --tun-server IP                 隧道内服务端地址，默认 10.0.0.1
   --bench-target IP               复用已有测速服务时的目标地址
