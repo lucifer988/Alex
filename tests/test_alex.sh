@@ -280,6 +280,17 @@ test_bench_mode_validation_accepts_only_managed_or_existing() {
         ! alex_validate_bench_mode random
 }
 
+test_option_parse_defaults_remote_mode_to_server() (
+    # shellcheck disable=SC2030,SC2031
+    export ALEX_LIB="$ROOT/lib/alex-core.sh"
+    # shellcheck disable=SC2030,SC2031
+    export ALEX_NODE_HELPER=/bin/true
+    # shellcheck source=../alex
+    source "$ROOT/alex"
+    parse_args optimize --ssh-host 1.2.3.4 --ssh-key /tmp/key --yes
+    [[ "$REMOTE_MODE" == server ]]
+)
+
 test_option_parse_accepts_server_mode_and_existing_bench() (
     # shellcheck disable=SC2030,SC2031
     export ALEX_LIB="$ROOT/lib/alex-core.sh"
@@ -343,6 +354,7 @@ test_case 'benchmark rejects service PID changes' test_benchmark_rejects_pid_cha
 test_case 'missing option values fail clearly' test_missing_option_value_has_clear_failure
 test_case 'remote mode validation only allows client/server' test_remote_mode_validation_accepts_only_client_or_server
 test_case 'bench mode validation only allows managed/existing' test_bench_mode_validation_accepts_only_managed_or_existing
+test_case 'remote mode defaults to server' test_option_parse_defaults_remote_mode_to_server
 test_case 'parse_args accepts server mode and existing bench' test_option_parse_accepts_server_mode_and_existing_bench
 test_case 'existing bench mode uses explicit bench target' test_existing_bench_mode_uses_bench_target
 
